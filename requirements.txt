@@ -1,0 +1,60 @@
+# ===========================
+# Core Dependencies
+# ===========================
+python-dotenv==1.0.0
+requests==2.31.0
+httpx==0.24.1  # For async HTTP support
+
+# ===========================
+# Service Integrations
+# ===========================
+# Gmail
+secure-smtplib==0.1.1
+chardet==5.2.0  # For encoding detection
+html2text==2020.1.16  # For HTML email parsing
+
+# OpenAI
+openai==1.35.0
+
+# ===========================
+# Utilities
+# ===========================
+# Logging
+python-json-logger==2.0.7
+
+# Retry logic
+tenacity==8.2.3
+
+# Date handling
+python-dateutil==2.8.2
+
+# Data validation
+jsonschema==4.19.0
+
+# ===========================
+# Optional: Secret Managers
+# ===========================
+# Uncomment based on your secret backend choice
+
+# AWS Secrets Manager
+# boto3==1.28.0
+# botocore==1.31.0
+
+# Azure Key Vault
+# azure-keyvault-secrets==4.7.0
+# azure-identity==1.14.0
+
+# Google Secret Manager
+# google-cloud-secret-manager==2.16.0
+
+# ===========================
+# Development Dependencies
+# ===========================
+# Uncomment for development/testing
+
+# pytest==7.4.0
+# pytest-cov==4.1.0
+# black==23.7.0
+# flake8==6.1.0
+# mypy==1.5.0
+# pre-commit==3.3.3
