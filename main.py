@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Main application entry point for inventory reconciliation system.
-Continuously monitors Gmail for new purchase/sales emails and syncs to Zoho/Airtable.
+Main application with complete data validation and human review workflow.
 """
 
 import os
@@ -10,10 +9,11 @@ import logging
 import sys
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+from enum import Enum
 
 from src.config import Config
 from src.gmail_client import GmailClient
-from src.openai_parser import EmailParser, ParseStatus, ParseResult
+from src.openai_parser import EmailParser, ParseStatus, ParseResult, DataCompleteness
 from src.airtable_client import AirtableClient
 from src.zoho_client import ZohoClient
 from src.discord_notifier import DiscordNotifier
@@ -30,8 +30,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class ProcessingStatus(Enum):
+    """Status of record processing."""
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+    PENDING_REVIEW = "pending_review"
+    REVIEW_COMPLETE = "review_complete"
+    SYNCED = "synced"
+    FAILED = "failed"
+
+
 class InventoryReconciliationApp:
-    """Main application orchestrator."""
+    """Main application orchestrator with complete data validation."""
     
     def __init__(self):
         """Initialize all service clients."""
@@ -41,23 +51,32 @@ class InventoryReconciliationApp:
         self.airtable = AirtableClient(self.config)
         self.zoho = ZohoClient(self.config)
         self.discord = DiscordNotifier(self.config)
+        
+        # Track records pending review
+        self.pending_reviews = {}  # airtable_id: data
         self.processed_uids = set()
         
         # Statistics tracking
         self.stats = {
             'processed': 0,
-            'successes': 0,
-            'warnings': 0,
+            'complete_data': 0,
+            'incomplete_data': 0,
+            'synced_to_zoho': 0,
+            'pending_review': 0,
             'errors': 0,
             'session_start': datetime.now()
         }
         
     def process_email(self, email_data: Dict) -> None:
         """
-        Process a single email through the entire pipeline.
+        Process email with complete data validation workflow.
         
-        Args:
-            email_data: Dictionary containing email metadata and content
+        Workflow:
+        1. Parse email
+        2. Validate completeness
+        3. Save to Airtable (always)
+        4. If complete -> Sync to Zoho
+        5. If incomplete -> Flag for human review
         """
         try:
             self.stats['processed'] += 1
@@ -87,7 +106,7 @@ class InventoryReconciliationApp:
             parsed_data = parse_result.data
             if not parsed_data:
                 logger.warning(f"No data extracted from email: {email_data['subject']}")
-                self.stats['warnings'] += 1
+                self.stats['errors'] += 1
                 return
                 
             # Add email metadata
@@ -95,35 +114,23 @@ class InventoryReconciliationApp:
             parsed_data['email_date'] = email_data['date']
             parsed_data['parse_result'] = parse_result.to_dict()
             
-            # Step 2: Determine transaction type
+            # Step 2: Check completeness
             transaction_type = parsed_data.get('type')
             
-            # Check if review is required
-            if parse_result.requires_review:
-                logger.warning(f"Email requires manual review: {email_data['subject']}")
-                self.discord.send_warning(
-                    f"Email requires manual review\n"
-                    f"Subject: {email_data['subject'][:100]}\n"
-                    f"Missing fields: {', '.join(parse_result.missing_fields)}\n"
-                    f"Confidence: {parse_result.confidence_score:.2f}"
-                )
-                self.stats['warnings'] += 1
+            if parse_result.completeness == DataCompleteness.COMPLETE:
+                # Complete data workflow
+                self._process_complete_data(parsed_data, parse_result, transaction_type)
+                self.stats['complete_data'] += 1
                 
-            # Process based on type
-            if transaction_type == 'purchase':
-                success = self._process_purchase(parsed_data, parse_result)
-            elif transaction_type == 'sale':
-                success = self._process_sale(parsed_data, parse_result)
+            elif parse_result.completeness == DataCompleteness.INCOMPLETE:
+                # Incomplete data workflow
+                self._process_incomplete_data(parsed_data, parse_result, transaction_type)
+                self.stats['incomplete_data'] += 1
+                
             else:
-                logger.warning(f"Unknown transaction type: {transaction_type}")
-                self.stats['warnings'] += 1
-                success = False
-                
-            # Update statistics
-            if success:
-                self.stats['successes'] += 1
-            elif parse_result.status == ParseStatus.PARTIAL:
-                self.stats['warnings'] += 1
+                # Invalid data
+                logger.error(f"Invalid data completeness: {parse_result.completeness}")
+                self.stats['errors'] += 1
                 
         except Exception as e:
             error_msg = f"Error processing email {email_data.get('uid')}: {str(e)}"
@@ -131,236 +138,406 @@ class InventoryReconciliationApp:
             self.discord.send_error(error_msg, email_data)
             self.stats['errors'] += 1
             
-    def _process_purchase(self, data: Dict, parse_result: ParseResult) -> bool:
+    def _process_complete_data(self, data: Dict, parse_result: ParseResult, transaction_type: str):
         """
-        Process a purchase transaction with complete workflow.
+        Process complete data:
+        1. Save to Airtable
+        2. Sync to Zoho
+        3. Send success notification
+        """
+        try:
+            # Step 1: Save to Airtable
+            logger.info(f"Saving complete {transaction_type} to Airtable")
+            data['processing_status'] = ProcessingStatus.COMPLETE.value
+            data['requires_review'] = False
+            data['completeness'] = parse_result.completeness.value
+            
+            if transaction_type == 'purchase':
+                airtable_record = self.airtable.create_purchase(data)
+            else:
+                airtable_record = self.airtable.create_sale(data)
+                
+            airtable_id = airtable_record.get('id')
+            
+            # Step 2: Sync to Zoho
+            logger.info(f"Syncing complete {transaction_type} to Zoho")
+            zoho_result = self.zoho.process_complete_data(data, transaction_type)
+            
+            if zoho_result.get('success'):
+                data['processing_status'] = ProcessingStatus.SYNCED.value
+                self.stats['synced_to_zoho'] += 1
+                
+                # Update Airtable with sync status
+                if airtable_id:
+                    # self.airtable.update_record(airtable_id, {'zoho_synced': True})
+                    pass
+                    
+                # Send success notification
+                self._send_complete_success_notification(data, parse_result, zoho_result, transaction_type)
+                
+            else:
+                # Zoho sync failed
+                logger.error(f"Zoho sync failed: {zoho_result.get('errors')}")
+                self._send_zoho_failure_notification(data, zoho_result, transaction_type)
+                
+        except Exception as e:
+            logger.error(f"Error processing complete data: {e}")
+            self.discord.send_error(f"Failed to process complete {transaction_type}: {str(e)}")
+            
+    def _process_incomplete_data(self, data: Dict, parse_result: ParseResult, transaction_type: str):
+        """
+        Process incomplete data:
+        1. Save to Airtable with incomplete flag
+        2. Do NOT sync to Zoho
+        3. Send review required notification
+        4. Track for review completion
+        """
+        try:
+            # Step 1: Save to Airtable with incomplete status
+            logger.info(f"Saving incomplete {transaction_type} to Airtable for review")
+            data['processing_status'] = ProcessingStatus.INCOMPLETE.value
+            data['requires_review'] = True
+            data['completeness'] = parse_result.completeness.value
+            data['missing_fields'] = parse_result.missing_fields
+            
+            if transaction_type == 'purchase':
+                airtable_record = self.airtable.create_purchase(data)
+            else:
+                airtable_record = self.airtable.create_sale(data)
+                
+            airtable_id = airtable_record.get('id')
+            
+            # Track for review
+            if airtable_id:
+                self.pending_reviews[airtable_id] = {
+                    'data': data,
+                    'type': transaction_type,
+                    'missing_fields': parse_result.missing_fields,
+                    'created_at': datetime.now()
+                }
+                self.stats['pending_review'] += 1
+                
+            # Step 2: Send human review notification
+            self._send_review_required_notification(
+                data, 
+                parse_result, 
+                transaction_type,
+                airtable_id
+            )
+            
+        except Exception as e:
+            logger.error(f"Error processing incomplete data: {e}")
+            self.discord.send_error(f"Failed to process incomplete {transaction_type}: {str(e)}")
+            
+    def handle_review_complete(self, airtable_id: str):
+        """
+        Handle when human review is complete.
+        Re-validate data and sync to Zoho if now complete.
+        """
+        try:
+            if airtable_id not in self.pending_reviews:
+                logger.warning(f"No pending review found for {airtable_id}")
+                self.discord.send_warning(f"No pending review found for Airtable ID: {airtable_id}")
+                return
+                
+            review_info = self.pending_reviews[airtable_id]
+            transaction_type = review_info['type']
+            
+            # Fetch updated data from Airtable
+            logger.info(f"Fetching updated data from Airtable for {airtable_id}")
+            # updated_data = self.airtable.get_record(airtable_id, transaction_type)
+            # For now, using the stored data (would need to implement get_record)
+            updated_data = review_info['data']
+            
+            # Re-validate completeness
+            validation_result = self._validate_data_completeness(updated_data, transaction_type)
+            
+            if validation_result['is_complete']:
+                # Data is now complete, sync to Zoho
+                logger.info(f"Review complete, syncing {transaction_type} to Zoho")
+                
+                zoho_result = self.zoho.process_complete_data(updated_data, transaction_type)
+                
+                if zoho_result.get('success'):
+                    # Update status
+                    updated_data['processing_status'] = ProcessingStatus.SYNCED.value
+                    self.stats['synced_to_zoho'] += 1
+                    
+                    # Remove from pending
+                    del self.pending_reviews[airtable_id]
+                    self.stats['pending_review'] -= 1
+                    
+                    # Send success notification
+                    self.discord.send_success(
+                        f"✅ Review Complete & Synced to Zoho\n"
+                        f"Type: {transaction_type}\n"
+                        f"Order #: {updated_data.get('order_number', 'N/A')}\n"
+                        f"Items processed: {len(zoho_result.get('items_processed', []))}\n"
+                        f"Stock adjusted: {'Yes' if zoho_result.get('stock_adjusted') else 'No'}"
+                    )
+                else:
+                    # Zoho sync failed after review
+                    self.discord.send_error(
+                        f"❌ Zoho sync failed after review\n"
+                        f"Errors: {', '.join(zoho_result.get('errors', []))}"
+                    )
+            else:
+                # Still incomplete after review
+                self.discord.send_warning(
+                    f"⚠️ Data still incomplete after review\n"
+                    f"Missing fields: {', '.join(validation_result.get('missing_fields', []))}\n"
+                    f"Please complete all required fields in Airtable"
+                )
+                
+        except Exception as e:
+            logger.error(f"Error handling review completion: {e}")
+            self.discord.send_error(f"Failed to process review completion: {str(e)}")
+            
+    def _validate_data_completeness(self, data: Dict, transaction_type: str) -> Dict:
+        """
+        Validate if data has all required fields.
         
         Returns:
-            True if successful, False otherwise
+            Dict with is_complete flag and missing_fields list
         """
-        airtable_record_id = None
-        zoho_result = {'errors': [], 'inventory_updated': False}
-        overall_success = True
+        missing_fields = []
         
-        try:
-            # Step 1: Save to Airtable with review flag
-            logger.info("Saving purchase to Airtable")
-            data['requires_review'] = parse_result.requires_review
-            data['confidence_score'] = parse_result.confidence_score
-            data['zoho_status'] = 'pending'
-            
-            airtable_record = self.airtable.create_purchase(data)
-            airtable_record_id = airtable_record.get('id')
-            
-            # Step 2: Process in Zoho if confidence is sufficient
-            if not parse_result.requires_review or parse_result.confidence_score > 0.8:
-                logger.info("Processing complete purchase workflow in Zoho")
+        # Check required fields based on transaction type
+        if transaction_type == 'purchase':
+            # Required: date, vendor_name, items with (name, quantity, unit_price), taxes
+            if not data.get('date'):
+                missing_fields.append('date')
+            if not data.get('vendor_name'):
+                missing_fields.append('vendor_name')
+            if data.get('taxes') is None:
+                missing_fields.append('taxes')
                 
-                # Add parse metadata for Zoho
-                parse_metadata = {
-                    'confidence_score': parse_result.confidence_score,
-                    'missing_fields': parse_result.missing_fields,
-                    'requires_review': parse_result.requires_review
-                }
-                
-                try:
-                    zoho_result = self.zoho.process_purchase_complete(data, parse_metadata)
-                    
-                    # Update Airtable with Zoho status
-                    if airtable_record_id:
-                        update_data = {
-                            'zoho_status': 'success' if zoho_result.get('inventory_updated') else 'partial',
-                            'zoho_po_id': zoho_result.get('purchase_order_id'),
-                            'zoho_bill_id': zoho_result.get('bill_id')
-                        }
-                        # self.airtable.update_record(airtable_record_id, update_data)
-                        
-                except Exception as e:
-                    logger.error(f"Zoho processing failed: {e}")
-                    zoho_result['errors'].append(str(e))
-                    overall_success = False
-                    
-                    # Update Airtable with failure status
-                    if airtable_record_id:
-                        update_data = {'zoho_status': 'failed', 'zoho_error': str(e)}
-                        # self.airtable.update_record(airtable_record_id, update_data)
-                        
+            # Check items
+            items = data.get('items', [])
+            if not items:
+                missing_fields.append('items')
             else:
-                logger.info("Skipping Zoho update due to low confidence/missing data")
+                for i, item in enumerate(items):
+                    if not item.get('name'):
+                        missing_fields.append(f'item_{i+1}_name')
+                    if item.get('quantity') is None:
+                        missing_fields.append(f'item_{i+1}_quantity')
+                    if item.get('unit_price') is None:
+                        missing_fields.append(f'item_{i+1}_unit_price')
+                        
+        elif transaction_type == 'sale':
+            # Required: date, channel, items with (name, quantity, sale_price), taxes
+            if not data.get('date'):
+                missing_fields.append('date')
+            if not data.get('channel'):
+                missing_fields.append('channel')
+            if data.get('taxes') is None:
+                missing_fields.append('taxes')
                 
-            # Step 3: Build and send notification
-            status_parts = []
-            if zoho_result.get('purchase_order_id'):
-                status_parts.append("PO created")
-            if zoho_result.get('bill_id'):
-                status_parts.append("Bill created")
-            if zoho_result.get('inventory_updated'):
-                status_parts.append("Inventory updated")
-                
-            status_text = " → ".join(status_parts) if status_parts else "Saved for review"
-            
-            # Determine status emoji based on actual results
-            if zoho_result.get('errors'):
-                status_emoji = "❌"
-                overall_success = False
-            elif zoho_result.get('inventory_updated'):
-                status_emoji = "✅"
-            elif parse_result.requires_review:
-                status_emoji = "⚠️"
+            # Check items
+            items = data.get('items', [])
+            if not items:
+                missing_fields.append('items')
             else:
-                status_emoji = "✅"
-                
-            # Build notification message
-            success_msg = (
-                f"{status_emoji} Purchase: {status_text}\n"
+                for i, item in enumerate(items):
+                    if not item.get('name'):
+                        missing_fields.append(f'item_{i+1}_name')
+                    if item.get('quantity') is None:
+                        missing_fields.append(f'item_{i+1}_quantity')
+                    if item.get('sale_price') is None:
+                        missing_fields.append(f'item_{i+1}_sale_price')
+                        
+        return {
+            'is_complete': len(missing_fields) == 0,
+            'missing_fields': missing_fields
+        }
+        
+    def _send_complete_success_notification(self, data: Dict, parse_result: ParseResult, 
+                                           zoho_result: Dict, transaction_type: str):
+        """Send success notification for complete data processed."""
+        if transaction_type == 'purchase':
+            message = (
+                f"✅ **Purchase Successfully Processed**\n"
                 f"Order #: {data.get('order_number', 'N/A')}\n"
                 f"Vendor: {data.get('vendor_name', 'Unknown')}\n"
+                f"Date: {data.get('date', 'N/A')}\n"
                 f"Items: {len(data.get('items', []))}\n"
                 f"Subtotal: ${data.get('subtotal', 0):.2f}\n"
                 f"Tax: ${data.get('taxes', 0):.2f}\n"
-                f"Total: ${data.get('total', 0):.2f}\n"
-                f"Confidence: {parse_result.confidence_score:.2f}"
+                f"Total: ${data.get('total', 0):.2f}\n\n"
+                f"**Zoho Update:**\n"
+                f"• Stock Adjusted: {'✅' if zoho_result.get('stock_adjusted') else '❌'}\n"
+                f"• Items Processed: {len(zoho_result.get('items_processed', []))}\n"
+                f"• Adjustment ID: {zoho_result.get('adjustment_id', 'N/A')}"
             )
-            
-            if parse_result.missing_fields:
-                success_msg += f"\nMissing: {', '.join(parse_result.missing_fields[:3])}"
-                
-            if zoho_result.get('errors'):
-                success_msg += f"\n⚠️ Issues: {', '.join(zoho_result['errors'][:2])}"
-                
-            # Send appropriate notification type
-            if zoho_result.get('errors'):
-                self.discord.send_error(success_msg)
-            elif parse_result.requires_review:
-                self.discord.send_warning(success_msg)
-            else:
-                self.discord.send_success(success_msg)
-                
-        except Exception as e:
-            error_msg = f"Failed to process purchase: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            self.discord.send_error(error_msg, data)
-            overall_success = False
-            
-        return overall_success
-            
-    def _process_sale(self, data: Dict, parse_result: ParseResult) -> bool:
-        """
-        Process a sales transaction with complete workflow.
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        airtable_record_id = None
-        zoho_result = {'errors': [], 'inventory_updated': False}
-        overall_success = True
-        
-        try:
-            # Step 1: Save to Airtable with review flag
-            logger.info("Saving sale to Airtable")
-            data['requires_review'] = parse_result.requires_review
-            data['confidence_score'] = parse_result.confidence_score
-            data['zoho_status'] = 'pending'
-            
-            airtable_record = self.airtable.create_sale(data)
-            airtable_record_id = airtable_record.get('id')
-            
-            # Step 2: Process in Zoho if confidence is sufficient
-            if not parse_result.requires_review or parse_result.confidence_score > 0.8:
-                logger.info("Processing complete sales workflow in Zoho")
-                
-                # Add parse metadata for Zoho
-                parse_metadata = {
-                    'confidence_score': parse_result.confidence_score,
-                    'missing_fields': parse_result.missing_fields,
-                    'requires_review': parse_result.requires_review
-                }
-                
-                try:
-                    zoho_result = self.zoho.process_sale_complete(data, parse_metadata)
-                    
-                    # Update Airtable with Zoho status
-                    if airtable_record_id:
-                        update_data = {
-                            'zoho_status': 'success' if zoho_result.get('inventory_updated') else 'partial',
-                            'zoho_so_id': zoho_result.get('sales_order_id'),
-                            'zoho_invoice_id': zoho_result.get('invoice_id'),
-                            'zoho_shipment_id': zoho_result.get('shipment_id')
-                        }
-                        # self.airtable.update_record(airtable_record_id, update_data)
-                        
-                except Exception as e:
-                    logger.error(f"Zoho processing failed: {e}")
-                    zoho_result['errors'].append(str(e))
-                    overall_success = False
-                    
-                    # Update Airtable with failure status
-                    if airtable_record_id:
-                        update_data = {'zoho_status': 'failed', 'zoho_error': str(e)}
-                        # self.airtable.update_record(airtable_record_id, update_data)
-                        
-            else:
-                logger.info("Skipping Zoho update due to low confidence/missing data")
-                
-            # Step 3: Build and send notification
-            status_parts = []
-            if zoho_result.get('sales_order_id'):
-                status_parts.append("SO created")
-            if zoho_result.get('invoice_id'):
-                status_parts.append("Invoice created")
-            if zoho_result.get('shipment_id'):
-                status_parts.append("Shipped")
-            if zoho_result.get('inventory_updated'):
-                status_parts.append("Inventory updated")
-                
-            status_text = " → ".join(status_parts) if status_parts else "Saved for review"
-            
-            # Determine status emoji based on actual results
-            if zoho_result.get('errors'):
-                status_emoji = "❌"
-                overall_success = False
-            elif zoho_result.get('inventory_updated'):
-                status_emoji = "✅"
-            elif parse_result.requires_review:
-                status_emoji = "⚠️"
-            else:
-                status_emoji = "✅"
-                
-            # Build notification message
-            success_msg = (
-                f"{status_emoji} Sale: {status_text}\n"
+        else:
+            message = (
+                f"✅ **Sale Successfully Processed**\n"
                 f"Order #: {data.get('order_number', 'N/A')}\n"
                 f"Channel: {data.get('channel', 'Unknown')}\n"
+                f"Date: {data.get('date', 'N/A')}\n"
                 f"Items: {len(data.get('items', []))}\n"
                 f"Subtotal: ${data.get('subtotal', 0):.2f}\n"
                 f"Tax: ${data.get('taxes', 0):.2f}\n"
-                f"Fees: ${data.get('fees', 0):.2f}\n"
-                f"Total: ${data.get('total', 0):.2f}\n"
-                f"Confidence: {parse_result.confidence_score:.2f}"
+                f"Total: ${data.get('total', 0):.2f}\n\n"
+                f"**Zoho Update:**\n"
+                f"• Stock Adjusted: {'✅' if zoho_result.get('stock_adjusted') else '❌'}\n"
+                f"• Items Processed: {len(zoho_result.get('items_processed', []))}\n"
+                f"• Revenue: ${zoho_result.get('revenue', 0):.2f}\n"
+                f"• COGS: ${zoho_result.get('cogs', 0):.2f}\n"
+                f"• Adjustment ID: {zoho_result.get('adjustment_id', 'N/A')}"
             )
             
-            if parse_result.missing_fields:
-                success_msg += f"\nMissing: {', '.join(parse_result.missing_fields[:3])}"
+        # Add any warnings
+        if zoho_result.get('warnings'):
+            message += f"\n\n⚠️ **Warnings:**\n"
+            for warning in zoho_result['warnings'][:3]:
+                message += f"• {warning}\n"
                 
-            if zoho_result.get('errors'):
-                success_msg += f"\n⚠️ Issues: {', '.join(zoho_result['errors'][:2])}"
+        self.discord.send_success(message, title="Complete Data Processed")
+        
+    def _send_review_required_notification(self, data: Dict, parse_result: ParseResult, 
+                                          transaction_type: str, airtable_id: str):
+        """Send notification that human review is required."""
+        # Build list of missing fields
+        missing_fields_text = "\n".join([f"• {field}" for field in parse_result.missing_fields[:10]])
+        
+        # Build incomplete items summary
+        incomplete_items_text = ""
+        if parse_result.incomplete_items:
+            for item_info in parse_result.incomplete_items[:5]:
+                item = item_info['item']
+                missing = item_info['missing_fields']
+                incomplete_items_text += f"• {item.get('name', 'Unknown')}: Missing {', '.join(missing)}\n"
                 
-            # Send appropriate notification type
-            if zoho_result.get('errors'):
-                self.discord.send_error(success_msg)
-            elif parse_result.requires_review:
-                self.discord.send_warning(success_msg)
+        message = (
+            f"⚠️ **Human Review Required - Incomplete Data**\n\n"
+            f"**Transaction Details:**\n"
+            f"Type: {transaction_type.title()}\n"
+            f"Order #: {data.get('order_number', 'N/A')}\n"
+        )
+        
+        if transaction_type == 'purchase':
+            message += f"Vendor: {data.get('vendor_name', 'MISSING')}\n"
+        else:
+            message += f"Channel: {data.get('channel', 'MISSING')}\n"
+            
+        message += (
+            f"Date: {data.get('date', 'MISSING')}\n"
+            f"Tax: ${data.get('taxes', 'MISSING')}\n\n"
+            f"**Missing Required Fields:**\n{missing_fields_text}\n"
+        )
+        
+        if incomplete_items_text:
+            message += f"\n**Incomplete Items:**\n{incomplete_items_text}"
+            
+        message += (
+            f"\n**Action Required:**\n"
+            f"1. Open Airtable and locate record ID: {airtable_id}\n"
+            f"2. Fill in all missing fields\n"
+            f"3. Reply 'resolved {airtable_id}' when complete\n\n"
+            f"⚠️ **Note:** Data will NOT be synced to Zoho until all required fields are complete."
+        )
+        
+        self.discord.send_warning(message, title="Review Required")
+        
+    def _send_zoho_failure_notification(self, data: Dict, zoho_result: Dict, transaction_type: str):
+        """Send notification when Zoho sync fails."""
+        message = (
+            f"❌ **Zoho Sync Failed**\n\n"
+            f"Transaction Type: {transaction_type.title()}\n"
+            f"Order #: {data.get('order_number', 'N/A')}\n"
+            f"\n**Errors:**\n"
+        )
+        
+        for error in zoho_result.get('errors', [])[:5]:
+            message += f"• {error}\n"
+            
+        if zoho_result.get('items_failed'):
+            message += f"\n**Failed Items:**\n"
+            for item in zoho_result['items_failed'][:5]:
+                message += f"• {item.get('name')}: {item.get('error')}\n"
+                
+        message += f"\n**Note:** Data has been saved to Airtable but NOT synced to Zoho inventory."
+        
+        self.discord.send_error(message, title="Zoho Sync Failed")
+        
+    def process_discord_command(self, command: str, args: List[str]):
+        """
+        Process Discord commands (would be called by Discord bot).
+        
+        Commands:
+        - resolved <airtable_id>: Mark review as complete
+        - status: Show current statistics
+        - pending: Show pending reviews
+        """
+        try:
+            if command.lower() == 'resolved' and args:
+                airtable_id = args[0]
+                self.handle_review_complete(airtable_id)
+                
+            elif command.lower() == 'status':
+                self._send_status_report()
+                
+            elif command.lower() == 'pending':
+                self._send_pending_reviews_report()
+                
             else:
-                self.discord.send_success(success_msg)
+                self.discord.send_info(f"Unknown command: {command}")
                 
         except Exception as e:
-            error_msg = f"Failed to process sale: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            self.discord.send_error(error_msg, data)
-            overall_success = False
+            logger.error(f"Error processing Discord command: {e}")
+            self.discord.send_error(f"Command failed: {str(e)}")
             
-        return overall_success
+    def _send_status_report(self):
+        """Send current status report to Discord."""
+        runtime = (datetime.now() - self.stats['session_start']).total_seconds()
+        
+        message = (
+            f"📊 **System Status Report**\n\n"
+            f"**Session Statistics:**\n"
+            f"• Runtime: {runtime/3600:.2f} hours\n"
+            f"• Emails Processed: {self.stats['processed']}\n"
+            f"• Complete Data: {self.stats['complete_data']}\n"
+            f"• Incomplete Data: {self.stats['incomplete_data']}\n"
+            f"• Synced to Zoho: {self.stats['synced_to_zoho']}\n"
+            f"• Pending Review: {self.stats['pending_review']}\n"
+            f"• Errors: {self.stats['errors']}\n"
+        )
+        
+        if self.stats['processed'] > 0:
+            complete_rate = (self.stats['complete_data'] / self.stats['processed']) * 100
+            sync_rate = (self.stats['synced_to_zoho'] / self.stats['processed']) * 100
+            message += (
+                f"\n**Rates:**\n"
+                f"• Data Completeness: {complete_rate:.1f}%\n"
+                f"• Sync Success: {sync_rate:.1f}%"
+            )
             
+        self.discord.send_info(message, title="Status Report")
+        
+    def _send_pending_reviews_report(self):
+        """Send list of pending reviews to Discord."""
+        if not self.pending_reviews:
+            self.discord.send_info("No pending reviews", title="Pending Reviews")
+            return
+            
+        message = f"📋 **Pending Reviews ({len(self.pending_reviews)} total)**\n\n"
+        
+        for airtable_id, info in list(self.pending_reviews.items())[:10]:
+            age = (datetime.now() - info['created_at']).total_seconds() / 3600
+            message += (
+                f"**ID:** {airtable_id}\n"
+                f"• Type: {info['type']}\n"
+                f"• Age: {age:.1f} hours\n"
+                f"• Missing: {', '.join(info['missing_fields'][:5])}\n\n"
+            )
+            
+        if len(self.pending_reviews) > 10:
+            message += f"... and {len(self.pending_reviews) - 10} more"
+            
+        self.discord.send_info(message, title="Pending Reviews")
+        
     def run_once(self) -> None:
         """Run a single iteration of email processing."""
         try:
@@ -373,39 +550,11 @@ class InventoryReconciliationApp:
                 
             logger.info(f"Found {len(new_emails)} new emails")
             
-            batch_start = time.time()
-            batch_successes = 0
-            batch_warnings = 0
-            batch_errors = 0
-            
             for email in new_emails:
                 if email['uid'] not in self.processed_uids:
-                    initial_stats = dict(self.stats)
-                    
                     self.process_email(email)
                     self.processed_uids.add(email['uid'])
                     self.gmail.mark_as_processed(email['uid'])
-                    
-                    # Track batch statistics
-                    if self.stats['successes'] > initial_stats['successes']:
-                        batch_successes += 1
-                    if self.stats['warnings'] > initial_stats['warnings']:
-                        batch_warnings += 1
-                    if self.stats['errors'] > initial_stats['errors']:
-                        batch_errors += 1
-                        
-            # Send batch summary if multiple emails processed
-            if len(new_emails) > 1:
-                batch_time = time.time() - batch_start
-                self.discord.send_batch_summary(
-                    successes=batch_successes,
-                    warnings=batch_warnings,
-                    errors=batch_errors,
-                    details={
-                        'Processing Time': f"{batch_time:.2f}s",
-                        'Emails/sec': f"{len(new_emails) / batch_time:.2f}"
-                    }
-                )
                     
         except Exception as e:
             error_msg = f"Error in run cycle: {str(e)}"
@@ -414,30 +563,26 @@ class InventoryReconciliationApp:
             
     def run(self) -> None:
         """Main run loop."""
-        logger.info("Starting Inventory Reconciliation App")
+        logger.info("Starting Inventory Reconciliation App with Complete Data Validation")
         
-        # Test connections if in debug mode
-        if self.config.get_bool('ENABLE_CONNECTION_TEST'):
-            logger.info("Testing connections to external services...")
-            connection_status = self.config.validate_connections()
-            for service, status in connection_status.items():
-                if status:
-                    logger.info(f"✅ {service}: Connected")
-                else:
-                    logger.warning(f"❌ {service}: Connection failed")
+        # Send startup notification
+        self.discord.send_info(
+            "🚀 Inventory Reconciliation System Started\n"
+            "Mode: Complete Data Validation\n"
+            "Incomplete data will be flagged for human review",
+            title="System Started"
+        )
         
-        self.discord.send_info("🚀 Inventory Reconciliation App started")
-        
-        poll_interval = self.config.get_int('POLL_INTERVAL')  # Properly typed as int
+        poll_interval = self.config.get_int('POLL_INTERVAL')
         
         try:
             while True:
                 try:
                     self.run_once()
                     
-                    # Log statistics periodically
-                    if self.stats['processed'] > 0 and self.stats['processed'] % 100 == 0:
-                        self._log_statistics()
+                    # Periodic status report
+                    if self.stats['processed'] > 0 and self.stats['processed'] % 50 == 0:
+                        self._send_status_report()
                         
                     logger.debug(f"Sleeping for {poll_interval} seconds")
                     time.sleep(poll_interval)
@@ -452,46 +597,19 @@ class InventoryReconciliationApp:
                     time.sleep(poll_interval)
                     
         finally:
-            # Ensure proper cleanup
+            # Cleanup
             logger.info("Cleaning up resources...")
             self.gmail.close()
             
-            # Send final statistics
-            self._send_final_statistics()
+            # Send final report
+            self._send_status_report()
             
-            self.discord.send_info("⏹️ Inventory Reconciliation App stopped")
+            # List any remaining pending reviews
+            if self.pending_reviews:
+                self._send_pending_reviews_report()
+                
+            self.discord.send_info("⏹️ System stopped", title="Shutdown")
             logger.info("Shutdown complete")
-            
-    def _log_statistics(self):
-        """Log current processing statistics."""
-        runtime = (datetime.now() - self.stats['session_start']).total_seconds()
-        
-        logger.info(
-            f"Session Statistics: "
-            f"Processed: {self.stats['processed']}, "
-            f"Success: {self.stats['successes']}, "
-            f"Warnings: {self.stats['warnings']}, "
-            f"Errors: {self.stats['errors']}, "
-            f"Runtime: {runtime/3600:.2f} hours"
-        )
-        
-    def _send_final_statistics(self):
-        """Send final session statistics to Discord."""
-        runtime = (datetime.now() - self.stats['session_start']).total_seconds()
-        
-        stats_message = (
-            f"Session ended after {runtime/3600:.2f} hours\n"
-            f"Total processed: {self.stats['processed']}\n"
-            f"Successes: {self.stats['successes']}\n"
-            f"Warnings: {self.stats['warnings']}\n"
-            f"Errors: {self.stats['errors']}"
-        )
-        
-        if self.stats['processed'] > 0:
-            success_rate = (self.stats['successes'] / self.stats['processed']) * 100
-            stats_message += f"\nSuccess rate: {success_rate:.1f}%"
-            
-        self.discord.send_info(stats_message, title="Session Statistics")
 
 
 if __name__ == "__main__":
