@@ -175,11 +175,8 @@ class GmailClient:
         try:
             # Search using UID for stability
             # First try with Gmail extensions if available
-            if self._check_capability('X-GM-EXT-1'):
-                search_criteria = f'(UNSEEN -X-GM-LABELS "{self.processed_label_name}")'
-            else:
-                # Fallback to standard IMAP
-                search_criteria = '(UNSEEN UNFLAGGED)'
+            search_criteria = 'UNSEEN'
+
                 
             logger.debug(f"Searching with criteria: {search_criteria}")
             
