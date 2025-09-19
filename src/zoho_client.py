@@ -1,8 +1,9 @@
-"""Zoho Inventory client with proper bill/invoice handling for inventory updates."""
+"""Zoho Inventory client with physical stock tracking and SKU generation."""
 
 import logging
 import requests
 import json
+import hashlib
 from typing import Dict, Optional, List, Tuple
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class ZohoClient:
-    """Handle Zoho Inventory API operations with proper inventory movement."""
+    """Handle Zoho Inventory API with physical stock tracking approach."""
     
     def __init__(self, config):
         self.config = config
@@ -30,15 +31,15 @@ class ZohoClient:
             'items': {},
             'vendors': {},
             'customers': {},
-            'taxes': {}
+            'taxes': {},
+            'skus_by_name': {}  # Cache SKUs by product name
         }
         self._cache_lock = Lock()
         
-        # Configuration flags
-        self.auto_create_bill = config.get_bool('ZOHO_AUTO_CREATE_BILL', True)
-        self.auto_create_invoice = config.get_bool('ZOHO_AUTO_CREATE_INVOICE', True)
-        self.auto_ship_sales = config.get_bool('ZOHO_AUTO_SHIP_SALES', True)
-        self.use_zoho_wac = config.get_bool('ZOHO_USE_NATIVE_WAC', True)
+        # Configuration flags - Using physical stock tracking instead of accounting
+        self.use_physical_stock = config.get_bool('ZOHO_USE_PHYSICAL_STOCK', True)
+        self.auto_generate_sku = config.get_bool('ZOHO_AUTO_GENERATE_SKU', True)
+        self.sku_prefix = config.get('ZOHO_SKU_PREFIX', 'AUTO')
         
         # Tax configuration
         self.default_tax_id = config.get('ZOHO_DEFAULT_TAX_ID')
@@ -85,7 +86,6 @@ class ZohoClient:
             params = {}
         params['organization_id'] = self.organization_id
         
-        # First attempt
         response = requests.request(
             method=method,
             url=url,
@@ -117,534 +117,565 @@ class ZohoClient:
         except Exception as e:
             logger.warning(f"Could not load tax configuration: {e}")
             
-    def process_purchase_complete(self, data: Dict, parse_metadata: Dict = None) -> Dict:
+    def process_complete_data(self, data: Dict, transaction_type: str) -> Dict:
         """
-        Complete purchase workflow: PO → Bill → Inventory Update
+        Process complete data using physical stock adjustments.
+        Only called when data is verified complete.
         
         Args:
-            data: Parsed purchase data
-            parse_metadata: Metadata about parsing quality
+            data: Complete parsed data
+            transaction_type: 'purchase' or 'sale'
             
         Returns:
-            Dictionary with created entity IDs
+            Dictionary with processing results
         """
         result = {
-            'purchase_order_id': None,
-            'bill_id': None,
-            'inventory_updated': False,
-            'errors': []
+            'success': False,
+            'stock_adjusted': False,
+            'items_processed': [],
+            'items_failed': [],
+            'errors': [],
+            'warnings': []
         }
         
         try:
-            # Step 1: Create Purchase Order
-            logger.info("Creating purchase order in Zoho")
-            po_response = self._create_purchase_order_internal(data, parse_metadata)
-            result['purchase_order_id'] = po_response['purchaseorder']['purchaseorder_id']
-            
-            # Step 2: Create Bill (this updates inventory)
-            if self.auto_create_bill:
-                logger.info("Creating bill to update inventory")
-                bill_response = self._create_bill_from_po(
-                    result['purchase_order_id'],
-                    data,
-                    parse_metadata
-                )
-                result['bill_id'] = bill_response['bill']['bill_id']
-                result['inventory_updated'] = True
-                
-                # Mark bill as paid if payment info available
-                if data.get('payment_status') == 'paid':
-                    self._mark_bill_paid(result['bill_id'], data)
+            if transaction_type == 'purchase':
+                result = self._process_purchase_stock(data)
+            elif transaction_type == 'sale':
+                result = self._process_sale_stock(data)
             else:
-                logger.info("Auto-bill creation disabled, inventory not updated")
+                result['errors'].append(f"Unknown transaction type: {transaction_type}")
                 
         except Exception as e:
-            error_msg = f"Purchase processing error: {str(e)}"
-            logger.error(error_msg)
-            result['errors'].append(error_msg)
-            raise
+            result['errors'].append(str(e))
+            logger.error(f"Error processing complete data: {e}")
             
         return result
         
-    def process_sale_complete(self, data: Dict, parse_metadata: Dict = None) -> Dict:
+    def _process_purchase_stock(self, data: Dict) -> Dict:
         """
-        Complete sales workflow: SO → Invoice → Shipment → Inventory Update
+        Process purchase using physical stock adjustment.
         
         Args:
-            data: Parsed sales data
-            parse_metadata: Metadata about parsing quality
+            data: Complete purchase data
             
         Returns:
-            Dictionary with created entity IDs
+            Processing result dictionary
         """
         result = {
-            'sales_order_id': None,
-            'invoice_id': None,
-            'shipment_id': None,
-            'inventory_updated': False,
-            'errors': []
+            'success': False,
+            'stock_adjusted': False,
+            'items_processed': [],
+            'items_failed': [],
+            'errors': [],
+            'warnings': [],
+            'adjustment_id': None
         }
         
         try:
-            # Step 1: Create Sales Order
-            logger.info("Creating sales order in Zoho")
-            so_response = self._create_sales_order_internal(data, parse_metadata)
-            result['sales_order_id'] = so_response['salesorder']['salesorder_id']
+            # Process each item
+            adjustment_items = []
+            total_cost = 0
             
-            # Step 2: Create Invoice (commits the sale)
-            if self.auto_create_invoice:
-                logger.info("Creating invoice from sales order")
-                invoice_response = self._create_invoice_from_so(
-                    result['sales_order_id'],
-                    data,
-                    parse_metadata
-                )
-                result['invoice_id'] = invoice_response['invoice']['invoice_id']
-                
-                # Mark as paid if payment received
-                if data.get('payment_status') == 'paid':
-                    self._mark_invoice_paid(result['invoice_id'], data)
+            for item in data.get('items', []):
+                try:
+                    # Get or create item with SKU
+                    item_id, sku_used = self._get_or_create_item_with_sku(
+                        item.get('sku'),
+                        item.get('upc'),
+                        item.get('product_id'),
+                        item.get('name')
+                    )
                     
-            # Step 3: Create Shipment (updates inventory)
-            if self.auto_ship_sales:
-                logger.info("Creating shipment to update inventory")
-                shipment_response = self._create_shipment(
-                    result['sales_order_id'],
-                    data
-                )
-                result['shipment_id'] = shipment_response['shipmentorder']['shipmentorder_id']
-                result['inventory_updated'] = True
+                    # Calculate item cost including tax proportion
+                    item_subtotal = item.get('quantity', 0) * item.get('unit_price', 0)
+                    tax_proportion = 0
+                    
+                    if data.get('taxes') and data.get('subtotal'):
+                        tax_rate = data.get('taxes') / data.get('subtotal')
+                        tax_proportion = item_subtotal * tax_rate
+                        
+                    item_total_cost = item_subtotal + tax_proportion
+                    unit_cost_with_tax = item_total_cost / max(1, item.get('quantity', 1))
+                    
+                    # Add to adjustment
+                    adjustment_items.append({
+                        'item_id': item_id,
+                        'quantity_adjusted': item.get('quantity', 0),
+                        'new_rate': unit_cost_with_tax,  # Cost per unit including tax
+                        'notes': f"Purchase from {data.get('vendor_name', 'Unknown')}"
+                    })
+                    
+                    total_cost += item_total_cost
+                    
+                    result['items_processed'].append({
+                        'name': item.get('name'),
+                        'sku': sku_used,
+                        'quantity': item.get('quantity'),
+                        'unit_cost': unit_cost_with_tax
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Failed to process item {item.get('name')}: {e}")
+                    result['items_failed'].append({
+                        'name': item.get('name'),
+                        'error': str(e)
+                    })
+                    result['warnings'].append(f"Item {item.get('name')} failed: {e}")
+                    
+            # Create stock adjustment if we have items
+            if adjustment_items:
+                try:
+                    adjustment_data = {
+                        'date': data.get('date', datetime.now().strftime('%Y-%m-%d')),
+                        'reason': 'Stock Received',
+                        'description': f"Purchase Order: {data.get('order_number', 'N/A')} from {data.get('vendor_name', 'Unknown')}",
+                        'adjustment_type': 'quantity',
+                        'line_items': adjustment_items,
+                        'reference_number': data.get('order_number'),
+                        'notes': self._build_adjustment_notes(data)
+                    }
+                    
+                    # Create the adjustment
+                    adjustment_response = self._make_api_request(
+                        'POST', 
+                        'inventoryadjustments',
+                        adjustment_data
+                    )
+                    
+                    result['adjustment_id'] = adjustment_response.get('inventory_adjustment', {}).get('inventory_adjustment_id')
+                    result['stock_adjusted'] = True
+                    result['success'] = True
+                    
+                    logger.info(f"Created stock adjustment for purchase: {result['adjustment_id']}")
+                    
+                except Exception as e:
+                    result['errors'].append(f"Failed to create stock adjustment: {e}")
+                    logger.error(f"Stock adjustment failed: {e}")
+                    
             else:
-                logger.info("Auto-shipment disabled, inventory not updated")
+                result['errors'].append("No items could be processed")
                 
         except Exception as e:
-            error_msg = f"Sales processing error: {str(e)}"
-            logger.error(error_msg)
-            result['errors'].append(error_msg)
-            raise
+            result['errors'].append(f"Purchase processing error: {e}")
+            logger.error(f"Failed to process purchase stock: {e}")
             
         return result
         
-    def _create_purchase_order_internal(self, data: Dict, parse_metadata: Dict = None) -> Dict:
-        """Create a purchase order with enhanced validation."""
-        # Get or create vendor with caching
-        vendor_id = self._get_or_create_vendor_cached(data.get('vendor_name'))
+    def _process_sale_stock(self, data: Dict) -> Dict:
+        """
+        Process sale using physical stock adjustment (reduction).
         
-        # Prepare line items with tax handling
-        line_items = []
-        for item in data.get('items', []):
-            item_id = self._get_or_create_item_cached(
-                item.get('sku'),
-                item.get('name')
-            )
+        Args:
+            data: Complete sales data
             
-            line_item = {
-                "item_id": item_id,
-                "quantity": item.get('quantity', 1),
-                "rate": item.get('unit_price', 0)
-            }
-            
-            # Handle item-level tax if available
-            if item.get('tax'):
-                line_item['tax_id'] = self._get_tax_id(item.get('tax_rate'))
-            elif self.default_tax_id:
-                line_item['tax_id'] = self.default_tax_id
-                
-            line_items.append(line_item)
-            
-        # Build PO data with metadata
-        po_data = {
-            "vendor_id": vendor_id,
-            "purchaseorder_number": data.get('order_number', self._generate_po_number()),
-            "date": data.get('date', datetime.now().strftime('%Y-%m-%d')),
-            "line_items": line_items,
-            "notes": self._build_notes(data, parse_metadata),
-            "is_inclusive_tax": self.tax_inclusive
+        Returns:
+            Processing result dictionary
+        """
+        result = {
+            'success': False,
+            'stock_adjusted': False,
+            'items_processed': [],
+            'items_failed': [],
+            'errors': [],
+            'warnings': [],
+            'adjustment_id': None,
+            'revenue': 0,
+            'cogs': 0
         }
         
-        # Add header-level adjustments
-        if data.get('taxes') and not self.tax_inclusive:
-            po_data['tax_total'] = data.get('taxes')
-            
-        if data.get('shipping'):
-            po_data['adjustment'] = data.get('shipping')
-            po_data['adjustment_description'] = "Shipping & Handling"
-            
-        # Add custom fields for tracking
-        po_data['custom_fields'] = [
-            {"customfield_id": "email_uid", "value": data.get('email_uid', '')},
-            {"customfield_id": "confidence_score", "value": str(data.get('confidence_score', 0))},
-            {"customfield_id": "requires_review", "value": str(data.get('requires_review', False))}
-        ]
-        
-        return self._make_api_request('POST', 'purchaseorders', po_data)
-        
-    def _create_bill_from_po(self, po_id: str, data: Dict, parse_metadata: Dict = None) -> Dict:
-        """Create a bill from purchase order to update inventory."""
-        # Get PO details
-        po_response = self._make_api_request('GET', f'purchaseorders/{po_id}')
-        po = po_response['purchaseorder']
-        
-        # Build bill data
-        bill_data = {
-            "vendor_id": po['vendor_id'],
-            "bill_number": f"BILL-{data.get('order_number', po['purchaseorder_number'])}",
-            "date": data.get('date', datetime.now().strftime('%Y-%m-%d')),
-            "due_date": (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d'),
-            "purchaseorder_ids": [po_id],
-            "line_items": po['line_items'],  # Copy from PO
-            "notes": f"Auto-created from PO {po['purchaseorder_number']}"
-        }
-        
-        # Add adjustments if present
-        if po.get('adjustment'):
-            bill_data['adjustment'] = po['adjustment']
-            bill_data['adjustment_description'] = po.get('adjustment_description', 'Adjustment')
-            
-        return self._make_api_request('POST', 'bills', bill_data)
-        
-    def _create_sales_order_internal(self, data: Dict, parse_metadata: Dict = None) -> Dict:
-        """Create a sales order with enhanced validation."""
-        # Get or create customer with caching
-        customer_id = self._get_or_create_customer_cached(
-            data.get('customer_email', f"{data.get('channel')}_customer"),
-            data.get('channel')
-        )
-        
-        # Prepare line items
-        line_items = []
-        for item in data.get('items', []):
-            item_id = self._get_or_create_item_cached(
-                item.get('sku'),
-                item.get('name')
-            )
-            
-            line_item = {
-                "item_id": item_id,
-                "quantity": item.get('quantity', 1),
-                "rate": item.get('sale_price', 0)
-            }
-            
-            # Handle item-level tax
-            if item.get('tax'):
-                line_item['tax_id'] = self._get_tax_id(item.get('tax_rate'))
-            elif self.default_tax_id:
-                line_item['tax_id'] = self.default_tax_id
-                
-            line_items.append(line_item)
-            
-        # Build SO data
-        so_data = {
-            "customer_id": customer_id,
-            "salesorder_number": data.get('order_number', self._generate_so_number()),
-            "date": data.get('date', datetime.now().strftime('%Y-%m-%d')),
-            "line_items": line_items,
-            "notes": self._build_notes(data, parse_metadata),
-            "is_inclusive_tax": self.tax_inclusive
-        }
-        
-        # Add adjustments
-        if data.get('taxes') and not self.tax_inclusive:
-            so_data['tax_total'] = data.get('taxes')
-            
-        if data.get('fees'):
-            so_data['adjustment'] = -abs(data.get('fees'))  # Negative for fees
-            so_data['adjustment_description'] = f"{data.get('channel', 'Platform')} Fees"
-            
-        # Add custom fields
-        so_data['custom_fields'] = [
-            {"customfield_id": "channel", "value": data.get('channel', '')},
-            {"customfield_id": "email_uid", "value": data.get('email_uid', '')},
-            {"customfield_id": "confidence_score", "value": str(data.get('confidence_score', 0))}
-        ]
-        
-        return self._make_api_request('POST', 'salesorders', so_data)
-        
-    def _create_invoice_from_so(self, so_id: str, data: Dict, parse_metadata: Dict = None) -> Dict:
-        """Create an invoice from sales order."""
-        # Get SO details
-        so_response = self._make_api_request('GET', f'salesorders/{so_id}')
-        so = so_response['salesorder']
-        
-        # Build invoice data
-        invoice_data = {
-            "customer_id": so['customer_id'],
-            "invoice_number": f"INV-{data.get('order_number', so['salesorder_number'])}",
-            "date": data.get('date', datetime.now().strftime('%Y-%m-%d')),
-            "due_date": datetime.now().strftime('%Y-%m-%d'),  # Due immediately for online sales
-            "salesorder_id": so_id,
-            "line_items": so['line_items'],
-            "notes": f"Auto-created from SO {so['salesorder_number']}"
-        }
-        
-        # Copy adjustments
-        if so.get('adjustment'):
-            invoice_data['adjustment'] = so['adjustment']
-            invoice_data['adjustment_description'] = so.get('adjustment_description', 'Adjustment')
-            
-        return self._make_api_request('POST', 'invoices', invoice_data)
-        
-    def _create_shipment(self, so_id: str, data: Dict) -> Dict:
-        """Create a shipment to update inventory."""
-        # Get SO details for line items
-        so_response = self._make_api_request('GET', f'salesorders/{so_id}')
-        so = so_response['salesorder']
-        
-        # Build shipment data
-        shipment_data = {
-            "salesorder_id": so_id,
-            "shipment_number": f"SHIP-{so['salesorder_number']}",
-            "date": data.get('ship_date', datetime.now().strftime('%Y-%m-%d')),
-            "delivery_method": data.get('shipping_method', 'Standard'),
-            "tracking_number": data.get('tracking_number', ''),
-            "line_items": [
-                {
-                    "so_line_item_id": item['line_item_id'],
-                    "quantity": item['quantity']
-                }
-                for item in so['line_items']
-            ],
-            "notes": f"Auto-shipped for {data.get('channel', 'online')} order"
-        }
-        
-        return self._make_api_request('POST', 'shipmentorders', shipment_data)
-        
-    def _mark_bill_paid(self, bill_id: str, data: Dict):
-        """Mark a bill as paid."""
         try:
-            payment_data = {
-                "vendor_id": data.get('vendor_id'),
-                "payment_mode": data.get('payment_method', 'Bank Transfer'),
-                "amount": data.get('total', 0),
-                "date": data.get('payment_date', datetime.now().strftime('%Y-%m-%d')),
-                "bills": [
-                    {
-                        "bill_id": bill_id,
-                        "amount_applied": data.get('total', 0)
-                    }
-                ]
-            }
+            # Process each item
+            adjustment_items = []
+            total_revenue = 0
+            total_cogs = 0
             
-            self._make_api_request('POST', 'vendorpayments', payment_data)
-            logger.info(f"Marked bill {bill_id} as paid")
-            
-        except Exception as e:
-            logger.warning(f"Could not mark bill as paid: {e}")
-            
-    def _mark_invoice_paid(self, invoice_id: str, data: Dict):
-        """Mark an invoice as paid."""
-        try:
-            payment_data = {
-                "customer_id": data.get('customer_id'),
-                "payment_mode": data.get('payment_method', 'Online Payment'),
-                "amount": data.get('total', 0),
-                "date": data.get('payment_date', datetime.now().strftime('%Y-%m-%d')),
-                "invoices": [
-                    {
-                        "invoice_id": invoice_id,
-                        "amount_applied": data.get('total', 0)
-                    }
-                ]
-            }
-            
-            self._make_api_request('POST', 'customerpayments', payment_data)
-            logger.info(f"Marked invoice {invoice_id} as paid")
-            
-        except Exception as e:
-            logger.warning(f"Could not mark invoice as paid: {e}")
-            
-    @lru_cache(maxsize=1000)
-    def _get_or_create_vendor_cached(self, vendor_name: str) -> str:
-        """Get or create vendor with caching."""
-        with self._cache_lock:
-            # Check cache first
-            if vendor_name in self._cache['vendors']:
-                return self._cache['vendors'][vendor_name]
-                
-        # Search for existing vendor (exact match)
-        params = {'vendor_name': vendor_name}
-        response = self._make_api_request('GET', 'vendors', params=params)
-        
-        vendors = response.get('vendors', [])
-        for vendor in vendors:
-            if vendor['vendor_name'].lower() == vendor_name.lower():
-                vendor_id = vendor['vendor_id']
-                with self._cache_lock:
-                    self._cache['vendors'][vendor_name] = vendor_id
-                return vendor_id
-                
-        # Create new vendor
-        vendor_data = {
-            "vendor_name": vendor_name,
-            "contact_type": "vendor",
-            "vendor_email": f"{vendor_name.lower().replace(' ', '_')}@vendor.com"
-        }
-        
-        response = self._make_api_request('POST', 'vendors', vendor_data)
-        vendor_id = response['vendor']['vendor_id']
-        
-        with self._cache_lock:
-            self._cache['vendors'][vendor_name] = vendor_id
-            
-        logger.info(f"Created new vendor: {vendor_name}")
-        return vendor_id
-        
-    @lru_cache(maxsize=1000)
-    def _get_or_create_customer_cached(self, customer_identifier: str, channel: str = None) -> str:
-        """Get or create customer with caching."""
-        with self._cache_lock:
-            cache_key = f"{customer_identifier}_{channel}"
-            if cache_key in self._cache['customers']:
-                return self._cache['customers'][cache_key]
-                
-        # Search for existing customer
-        if '@' in customer_identifier:
-            params = {'email': customer_identifier}
-        else:
-            params = {'customer_name': customer_identifier}
-            
-        response = self._make_api_request('GET', 'customers', params=params)
-        
-        customers = response.get('customers', [])
-        if customers:
-            # Use exact match
-            for customer in customers:
-                if '@' in customer_identifier:
-                    if customer.get('email', '').lower() == customer_identifier.lower():
-                        customer_id = customer['customer_id']
-                        with self._cache_lock:
-                            self._cache['customers'][cache_key] = customer_id
-                        return customer_id
-                else:
-                    if customer.get('customer_name', '').lower() == customer_identifier.lower():
-                        customer_id = customer['customer_id']
-                        with self._cache_lock:
-                            self._cache['customers'][cache_key] = customer_id
-                        return customer_id
+            for item in data.get('items', []):
+                try:
+                    # Get or create item with SKU
+                    item_id, sku_used = self._get_or_create_item_with_sku(
+                        item.get('sku'),
+                        item.get('upc'),
+                        item.get('product_id'),
+                        item.get('name')
+                    )
+                    
+                    # Get current stock and cost
+                    item_details = self._get_item_details(item_id)
+                    current_stock = item_details.get('stock_on_hand', 0)
+                    current_cost = item_details.get('purchase_rate', 0)
+                    
+                    # Check if we have sufficient stock
+                    if current_stock < item.get('quantity', 0):
+                        result['warnings'].append(
+                            f"Insufficient stock for {item.get('name')}: "
+                            f"have {current_stock}, need {item.get('quantity')}"
+                        )
                         
-        # Create new customer
-        customer_data = {
-            "customer_name": customer_identifier.split('@')[0] if '@' in customer_identifier else customer_identifier,
-            "customer_type": "individual",
-            "payment_terms": 0,
-            "notes": f"Channel: {channel}" if channel else ""
+                    # Add to adjustment (negative for sales)
+                    adjustment_items.append({
+                        'item_id': item_id,
+                        'quantity_adjusted': -item.get('quantity', 0),  # Negative for reduction
+                        'notes': f"Sale on {data.get('channel', 'Unknown')}"
+                    })
+                    
+                    # Calculate revenue and COGS
+                    item_revenue = item.get('quantity', 0) * item.get('sale_price', 0)
+                    item_cogs = item.get('quantity', 0) * current_cost
+                    
+                    total_revenue += item_revenue
+                    total_cogs += item_cogs
+                    
+                    result['items_processed'].append({
+                        'name': item.get('name'),
+                        'sku': sku_used,
+                        'quantity': item.get('quantity'),
+                        'sale_price': item.get('sale_price'),
+                        'cost': current_cost,
+                        'profit': item_revenue - item_cogs
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Failed to process item {item.get('name')}: {e}")
+                    result['items_failed'].append({
+                        'name': item.get('name'),
+                        'error': str(e)
+                    })
+                    result['warnings'].append(f"Item {item.get('name')} failed: {e}")
+                    
+            # Create stock adjustment if we have items
+            if adjustment_items:
+                try:
+                    adjustment_data = {
+                        'date': data.get('date', datetime.now().strftime('%Y-%m-%d')),
+                        'reason': 'Goods Sold',
+                        'description': f"Sale Order: {data.get('order_number', 'N/A')} on {data.get('channel', 'Unknown')}",
+                        'adjustment_type': 'quantity',
+                        'line_items': adjustment_items,
+                        'reference_number': data.get('order_number'),
+                        'notes': self._build_adjustment_notes(data)
+                    }
+                    
+                    # Create the adjustment
+                    adjustment_response = self._make_api_request(
+                        'POST',
+                        'inventoryadjustments',
+                        adjustment_data
+                    )
+                    
+                    result['adjustment_id'] = adjustment_response.get('inventory_adjustment', {}).get('inventory_adjustment_id')
+                    result['stock_adjusted'] = True
+                    result['success'] = True
+                    result['revenue'] = total_revenue
+                    result['cogs'] = total_cogs
+                    
+                    logger.info(f"Created stock adjustment for sale: {result['adjustment_id']}")
+                    
+                except Exception as e:
+                    result['errors'].append(f"Failed to create stock adjustment: {e}")
+                    logger.error(f"Stock adjustment failed: {e}")
+                    
+            else:
+                result['errors'].append("No items could be processed")
+                
+        except Exception as e:
+            result['errors'].append(f"Sale processing error: {e}")
+            logger.error(f"Failed to process sale stock: {e}")
+            
+        return result
+        
+    def _get_or_create_item_with_sku(self, sku: str, upc: str, product_id: str, name: str) -> Tuple[str, str]:
+        """
+        Get or create item with intelligent SKU handling.
+        
+        Args:
+            sku: Provided SKU (may be None)
+            upc: UPC if available
+            product_id: Other product identifier
+            name: Product name
+            
+        Returns:
+            Tuple of (item_id, sku_used)
+        """
+        # Try existing identifiers first
+        if sku:
+            item_id = self._find_item_by_sku(sku)
+            if item_id:
+                return item_id, sku
+                
+        if upc:
+            item_id = self._find_item_by_upc(upc)
+            if item_id:
+                return item_id, upc
+                
+        if product_id:
+            item_id = self._find_item_by_field('product_id', product_id)
+            if item_id:
+                return item_id, product_id
+                
+        # Try to find by name
+        with self._cache_lock:
+            if name in self._cache['skus_by_name']:
+                cached_sku = self._cache['skus_by_name'][name]
+                item_id = self._find_item_by_sku(cached_sku)
+                if item_id:
+                    return item_id, cached_sku
+                    
+        # Search for existing item by name
+        try:
+            params = {'name': name}
+            response = self._make_api_request('GET', 'items', params=params)
+            
+            items = response.get('items', [])
+            if items:
+                # Use exact name match
+                for item in items:
+                    if item.get('name', '').lower() == name.lower():
+                        item_id = item['item_id']
+                        item_sku = item.get('sku', '')
+                        
+                        # Cache the mapping
+                        with self._cache_lock:
+                            self._cache['skus_by_name'][name] = item_sku
+                            self._cache['items'][item_sku] = item_id
+                            
+                        return item_id, item_sku
+                        
+        except Exception as e:
+            logger.debug(f"Error searching for item by name: {e}")
+            
+        # Generate SKU if needed
+        if self.auto_generate_sku:
+            generated_sku = self._generate_sku(name, sku, upc, product_id)
+        else:
+            generated_sku = sku or upc or product_id or f"TEMP-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            
+        # Create new item
+        item_data = {
+            'name': name,
+            'sku': generated_sku.upper(),
+            'item_type': 'inventory',
+            'product_type': 'goods',
+            'purchase_rate': 0,
+            'selling_price': 0,
+            'inventory_account_name': 'Inventory Asset',
+            'purchase_account_name': 'Cost of Goods Sold',
+            'initial_stock': 0,
+            'reorder_level': 5,
+            'track_inventory': True
         }
         
-        if '@' in customer_identifier:
-            customer_data['email'] = customer_identifier
+        # Add UPC if available
+        if upc:
+            item_data['upc'] = upc
             
-        response = self._make_api_request('POST', 'customers', customer_data)
-        customer_id = response['customer']['customer_id']
+        try:
+            response = self._make_api_request('POST', 'items', item_data)
+            item_id = response['item']['item_id']
+            
+            # Cache the new item
+            with self._cache_lock:
+                self._cache['items'][generated_sku] = item_id
+                self._cache['skus_by_name'][name] = generated_sku
+                
+            logger.info(f"Created new item: {name} with SKU: {generated_sku}")
+            return item_id, generated_sku
+            
+        except Exception as e:
+            logger.error(f"Failed to create item {name}: {e}")
+            raise
+            
+    def _generate_sku(self, name: str, sku: str = None, upc: str = None, product_id: str = None) -> str:
+        """
+        Generate a SKU for an item.
         
-        with self._cache_lock:
-            self._cache['customers'][cache_key] = customer_id
+        Args:
+            name: Product name
+            sku: Existing SKU if any
+            upc: UPC if available
+            product_id: Other identifier
             
-        logger.info(f"Created new customer: {customer_identifier}")
-        return customer_id
+        Returns:
+            Generated SKU
+        """
+        if sku:
+            return sku
+            
+        if upc:
+            return f"UPC-{upc}"
+            
+        if product_id:
+            return f"ID-{product_id}"
+            
+        # Generate from name
+        # Clean name for SKU
+        clean_name = ''.join(c for c in name.upper() if c.isalnum() or c in [' ', '-'])
+        words = clean_name.split()
         
-    @lru_cache(maxsize=5000)
-    def _get_or_create_item_cached(self, sku: str, name: str = None) -> str:
-        """Get or create item with caching and exact matching."""
-        if not sku:
-            sku = f"UNKNOWN-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        # Take first letter of each word (max 4 words)
+        if len(words) > 1:
+            prefix = ''.join(w[0] for w in words[:4])
+        else:
+            # Use first 4 characters if single word
+            prefix = clean_name[:4]
             
+        # Add hash for uniqueness
+        name_hash = hashlib.md5(name.encode()).hexdigest()[:6].upper()
+        
+        return f"{self.sku_prefix}-{prefix}-{name_hash}"
+        
+    def _find_item_by_sku(self, sku: str) -> Optional[str]:
+        """Find item by SKU."""
+        # Check cache first
         with self._cache_lock:
             if sku in self._cache['items']:
                 return self._cache['items'][sku]
                 
-        # Search for existing item by SKU (exact match)
-        params = {'sku': sku}
-        response = self._make_api_request('GET', 'items', params=params)
-        
-        items = response.get('items', [])
-        for item in items:
-            if item.get('sku', '').upper() == sku.upper():
-                item_id = item['item_id']
-                with self._cache_lock:
-                    self._cache['items'][sku] = item_id
-                return item_id
-                
-        # Create new item
-        item_data = {
-            "name": name or sku,
-            "sku": sku.upper(),
-            "item_type": "inventory",
-            "purchase_rate": 0,
-            "selling_price": 0,
-            "inventory_account_name": "Inventory Asset",
-            "purchase_account_name": "Cost of Goods Sold",
-            "initial_stock": 0,
-            "reorder_level": 5  # Default reorder point
-        }
-        
-        response = self._make_api_request('POST', 'items', item_data)
-        item_id = response['item']['item_id']
-        
-        with self._cache_lock:
-            self._cache['items'][sku] = item_id
+        try:
+            params = {'sku': sku}
+            response = self._make_api_request('GET', 'items', params=params)
             
-        logger.info(f"Created new item: {sku} - {name}")
-        return item_id
-        
-    def _get_tax_id(self, tax_rate: float = None) -> Optional[str]:
-        """Get tax ID for given rate or use default."""
-        if tax_rate:
-            with self._cache_lock:
-                for tax_id, tax in self._cache.get('taxes', {}).items():
-                    if abs(tax.get('tax_percentage', 0) - tax_rate) < 0.01:
-                        return tax_id
+            items = response.get('items', [])
+            for item in items:
+                if item.get('sku', '').upper() == sku.upper():
+                    item_id = item['item_id']
+                    
+                    # Cache it
+                    with self._cache_lock:
+                        self._cache['items'][sku] = item_id
                         
-        return self.default_tax_id
+                    return item_id
+                    
+        except Exception as e:
+            logger.debug(f"Error finding item by SKU {sku}: {e}")
+            
+        return None
         
-    def _build_notes(self, data: Dict, parse_metadata: Dict = None) -> str:
-        """Build notes field with metadata."""
+    def _find_item_by_upc(self, upc: str) -> Optional[str]:
+        """Find item by UPC."""
+        try:
+            params = {'upc': upc}
+            response = self._make_api_request('GET', 'items', params=params)
+            
+            items = response.get('items', [])
+            if items:
+                return items[0]['item_id']
+                
+        except Exception as e:
+            logger.debug(f"Error finding item by UPC {upc}: {e}")
+            
+        return None
+        
+    def _find_item_by_field(self, field: str, value: str) -> Optional[str]:
+        """Find item by custom field."""
+        try:
+            # Search with custom field
+            params = {field: value}
+            response = self._make_api_request('GET', 'items', params=params)
+            
+            items = response.get('items', [])
+            if items:
+                return items[0]['item_id']
+                
+        except Exception as e:
+            logger.debug(f"Error finding item by {field} = {value}: {e}")
+            
+        return None
+        
+    def _get_item_details(self, item_id: str) -> Dict:
+        """Get detailed item information."""
+        try:
+            response = self._make_api_request('GET', f'items/{item_id}')
+            return response.get('item', {})
+            
+        except Exception as e:
+            logger.error(f"Failed to get item details for {item_id}: {e}")
+            return {}
+            
+    def _build_adjustment_notes(self, data: Dict) -> str:
+        """Build notes for stock adjustment."""
         notes = []
         
-        if data.get('channel'):
+        if data.get('order_number'):
+            notes.append(f"Order #: {data.get('order_number')}")
+            
+        if data.get('vendor_name'):
+            notes.append(f"Vendor: {data.get('vendor_name')}")
+        elif data.get('channel'):
             notes.append(f"Channel: {data.get('channel')}")
             
-        if parse_metadata:
-            if parse_metadata.get('confidence_score'):
-                notes.append(f"Confidence: {parse_metadata.get('confidence_score', 0):.2f}")
-            if parse_metadata.get('missing_fields'):
-                notes.append(f"Missing: {', '.join(parse_metadata.get('missing_fields', []))}")
-            if parse_metadata.get('requires_review'):
-                notes.append("⚠️ REQUIRES REVIEW")
-                
         if data.get('email_uid'):
             notes.append(f"Email UID: {data.get('email_uid')}")
             
+        if data.get('confidence_score'):
+            notes.append(f"Confidence: {data.get('confidence_score', 0):.2f}")
+            
         return ' | '.join(notes)
         
-    def _generate_po_number(self) -> str:
-        """Generate a unique PO number."""
-        return f"PO-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        
-    def _generate_so_number(self) -> str:
-        """Generate a unique SO number."""
-        return f"SO-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        
-    def get_inventory_levels(self, sku: str) -> Dict:
-        """Get current inventory levels for an item."""
+    def get_inventory_summary(self) -> Dict:
+        """Get summary of current inventory levels."""
         try:
-            item_id = self._get_or_create_item_cached(sku, sku)
-            response = self._make_api_request('GET', f'items/{item_id}')
+            response = self._make_api_request('GET', 'items')
             
-            item = response['item']
+            summary = {
+                'total_items': 0,
+                'total_stock_value': 0,
+                'low_stock_items': [],
+                'out_of_stock_items': []
+            }
+            
+            for item in response.get('items', []):
+                if item.get('item_type') == 'inventory':
+                    summary['total_items'] += 1
+                    
+                    stock = item.get('stock_on_hand', 0)
+                    rate = item.get('purchase_rate', 0)
+                    reorder_level = item.get('reorder_level', 0)
+                    
+                    summary['total_stock_value'] += stock * rate
+                    
+                    if stock == 0:
+                        summary['out_of_stock_items'].append({
+                            'name': item.get('name'),
+                            'sku': item.get('sku')
+                        })
+                    elif stock <= reorder_level:
+                        summary['low_stock_items'].append({
+                            'name': item.get('name'),
+                            'sku': item.get('sku'),
+                            'stock': stock,
+                            'reorder_level': reorder_level
+                        })
+                        
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Failed to get inventory summary: {e}")
+            return {}
+            
+    def verify_stock_levels(self, sku: str) -> Dict:
+        """Verify current stock levels for a specific SKU."""
+        try:
+            item_id = self._find_item_by_sku(sku)
+            if not item_id:
+                return {'error': f"SKU {sku} not found"}
+                
+            item = self._get_item_details(item_id)
+            
             return {
                 'sku': item.get('sku'),
                 'name': item.get('name'),
                 'stock_on_hand': item.get('stock_on_hand', 0),
                 'available_stock': item.get('available_stock', 0),
-                'actual_available_stock': item.get('actual_available_stock', 0),
                 'purchase_rate': item.get('purchase_rate', 0),
                 'selling_price': item.get('selling_price', 0),
-                'reorder_level': item.get('reorder_level', 0)
+                'reorder_level': item.get('reorder_level', 0),
+                'stock_value': item.get('stock_on_hand', 0) * item.get('purchase_rate', 0)
             }
             
         except Exception as e:
-            logger.error(f"Failed to get inventory levels for {sku}: {e}")
-            return {}
+            logger.error(f"Failed to verify stock for {sku}: {e}")
+            return {'error': str(e)}
             
     def clear_cache(self):
         """Clear the entity cache."""
@@ -653,29 +684,7 @@ class ZohoClient:
                 'items': {},
                 'vendors': {},
                 'customers': {},
-                'taxes': self._cache.get('taxes', {})  # Keep tax config
+                'taxes': self._cache.get('taxes', {}),  # Keep tax config
+                'skus_by_name': {}
             }
         logger.info("Cleared entity cache")
-        
-    # Legacy methods for backward compatibility
-    def create_purchase_order(self, data: Dict) -> Dict:
-        """Legacy method - redirects to complete workflow."""
-        logger.warning("Using legacy create_purchase_order - consider using process_purchase_complete")
-        return self.process_purchase_complete(data)
-        
-    def create_sales_order(self, data: Dict) -> Dict:
-        """Legacy method - redirects to complete workflow."""
-        logger.warning("Using legacy create_sales_order - consider using process_sale_complete")
-        return self.process_sale_complete(data)
-        
-    def update_item_cost(self, sku: str, quantity: float, unit_price: float, taxes: float):
-        """Legacy method - Zoho handles WAC automatically with bills."""
-        if not self.use_zoho_wac:
-            logger.warning("Manual WAC update requested but Zoho handles this automatically with bills")
-        # No-op as Zoho handles WAC through proper bill creation
-        pass
-        
-    def apply_cogs(self, sku: str, quantity: float):
-        """Legacy method - Zoho handles COGS automatically with shipments."""
-        # No-op as Zoho handles COGS through proper shipment creation
-        pass
