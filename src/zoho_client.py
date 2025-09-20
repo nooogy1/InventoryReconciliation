@@ -1,250 +1,63 @@
-def _get_or_create_item_with_sku(self, sku: str, upc: str, product_id: str, name: str) -> Tuple[str, str]:
-        """
-        Get or create item with intelligent SKU handling.
+"""Zoho Inventory client with physical stock tracking and SKU generation."""
+
+import logging
+import requests
+import json
+import hashlib
+from typing import Dict, Optional, List, Tuple
+from datetime import datetime, timedelta
+from functools import lru_cache
+from threading import Lock
+
+logger = logging.getLogger(__name__)
+
+
+class ZohoClient:
+    """Handle Zoho Inventory API with physical stock tracking approach."""
+    
+    def __init__(self, config):
+        self.config = config
+        self.organization_id = config.get('ZOHO_ORGANIZATION_ID')
+        self.access_token = None
+        self.base_url = "https://inventory.zohoapis.com/api/v1"
+        self.api_region = config.get('ZOHO_API_REGION', 'com')
         
-        Args:
-            sku: Provided SKU (may be None)
-            upc: UPC if available
-            product_id: Other product identifier
-            name: Product name
+        # Adjust base URL for region
+        if self.api_region != 'com':
+            self.base_url = f"https://inventory.zohoapis.{self.api_region}/api/v1"
             
-        Returns:
-            Tuple of (item_id, sku_used)
-        """
-        logger.info(f"🔍 Looking up/creating item: {name}")
-        
-        # Try existing identifiers first
-        if sku:
-            logger.info(f"   - Checking existing SKU: {sku}")
-            item_id = self._find_item_by_sku(sku)
-            if item_id:
-                logger.info(f"   ✅ Found existing item by SKU: {item_id}")
-                return item_id, sku
-                
-        if upc:
-            logger.info(f"   - Checking existing UPC: {upc}")
-            item_id = self._find_item_by_upc(upc)
-            if item_id:
-                logger.info(f"   ✅ Found existing item by UPC: {item_id}")
-                return item_id, upc
-                
-        if product_id:
-            logger.info(f"   - Checking existing Product ID: {product_id}")
-            item_id = self._find_item_by_field('product_id', product_id)
-            if item_id:
-                logger.info(f"   ✅ Found existing item by Product ID: {item_id}")
-                return item_id, product_id
-                
-        # Try to find by name
-        with self._cache_lock:
-            if name in self._cache['skus_by_name']:
-                cached_sku = self._cache['skus_by_name'][name]
-                logger.info(f"   - Checking cached SKU by name: {cached_sku}")
-                item_id = self._find_item_by_sku(cached_sku)
-                if item_id:
-                    logger.info(f"   ✅ Found existing item by cached name: {item_id}")
-                    return item_id, cached_sku
-                    
-        # Search for existing item by name
-        try:
-            logger.info(f"   - Searching Zoho for existing item by name...")
-            params = {'name': name}
-            response = self._make_api_request('GET', 'items', params=params)
-            
-            items = response.get('items', [])
-            if items:
-                # Use exact name match
-                for item in items:
-                    if item.get('name', '').lower() == name.lower():
-                        item_id = item['item_id']
-                        item_sku = item.get('sku', '')
-                        
-                        logger.info(f"   ✅ Found existing item by name search: {item_id}")
-                        
-                        # Cache the mapping
-                        with self._cache_lock:
-                            self._cache['skus_by_name'][name] = item_sku
-                            self._cache['items'][item_sku] = item_id
-                            
-                        return item_id, item_sku
-                        
-        except Exception as e:
-            logger.debug(f"   ⚠️ Error searching for item by name: {e}")
-            
-        # Generate SKU if needed
-        if self.auto_generate_sku:
-            generated_sku = self._generate_sku(name, sku, upc, product_id)
-        else:
-            generated_sku = sku or upc or product_id or f"TEMP-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-            
-        logger.info(f"   🆕 Creating new item with SKU: {generated_sku}")
-        
-        # Create new item
-        item_data = {
-            'name': name,
-            'sku': generated_sku.upper(),
-            'item_type': 'inventory',
-            'product_type': 'goods',
-            'purchase_rate': 0,
-            'selling_price': 0,
-            'inventory_account_name': 'Inventory Asset',
-            'purchase_account_name': 'Cost of Goods Sold',
-            'initial_stock': 0,
-            'reorder_level': 5,
-            'track_inventory': True
+        # Cache for entities to avoid repeated lookups
+        self._cache = {
+            'items': {},
+            'vendors': {},
+            'customers': {},
+            'taxes': {},
+            'skus_by_name': {}  # Cache SKUs by product name
         }
+        self._cache_lock = Lock()
         
-        # Add UPC if available
-        if upc:
-            item_data['upc'] = upc
-            
-        try:
-            response = self._make_api_request('POST', 'items', item_data)
-            item_id = response['item']['item_id']
-            
-            # Cache the new item
-            with self._cache_lock:
-                self._cache['items'][generated_sku] = item_id
-                self._cache['skus_by_name'][name] = generated_sku
-                
-            logger.info(f"   ✅ Created new item successfully: {item_id}")
-            return item_id, generated_sku
-            
-        except Exception as e:
-            logger.error(f"   ❌ Failed to create item {name}: {e}")
-            raise
-            
-    def _generate_sku(self, name: str, sku: str = None, upc: str = None, product_id: str = None) -> str:
-        """
-        Generate a SKU for an item.
+        # Configuration flags - Using physical stock tracking instead of accounting
+        self.use_physical_stock = config.get_bool('ZOHO_USE_PHYSICAL_STOCK', True)
+        self.auto_generate_sku = config.get_bool('ZOHO_AUTO_GENERATE_SKU', True)
+        self.sku_prefix = config.get('ZOHO_SKU_PREFIX', 'AUTO')
         
-        Args:
-            name: Product name
-            sku: Existing SKU if any
-            upc: UPC if available
-            product_id: Other identifier
-            
-        Returns:
-            Generated SKU
-        """
-        if sku:
-            return sku
-            
-        if upc:
-            return f"UPC-{upc}"
-            
-        if product_id:
-            return f"ID-{product_id}"
-            
-        # Generate from name
-        # Clean name for SKU
-        clean_name = ''.join(c for c in name.upper() if c.isalnum() or c in [' ', '-'])
-        words = clean_name.split()
+        # Tax configuration
+        self.default_tax_id = config.get('ZOHO_DEFAULT_TAX_ID')
+        self.tax_inclusive = config.get_bool('ZOHO_TAX_INCLUSIVE', False)
         
-        # Take first letter of each word (max 4 words)
-        if len(words) > 1:
-            prefix = ''.join(w[0] for w in words[:4])
-        else:
-            # Use first 4 characters if single word
-            prefix = clean_name[:4]
-            
-        # Add hash for uniqueness
-        name_hash = hashlib.md5(name.encode()).hexdigest()[:6].upper()
+        logger.info(f"🔧 Initializing Zoho client...")
+        logger.info(f"   - Organization ID: {self.organization_id}")
+        logger.info(f"   - API Region: {self.api_region}")
+        logger.info(f"   - Physical Stock Mode: {self.use_physical_stock}")
+        logger.info(f"   - Auto Generate SKU: {self.auto_generate_sku}")
         
-        return f"{self.sku_prefix}-{prefix}-{name_hash}"
+        self._refresh_access_token()
+        self._load_tax_configuration()
         
-    def _find_item_by_sku(self, sku: str) -> Optional[str]:
-        """Find item by SKU."""
-        # Check cache first
-        with self._cache_lock:
-            if sku in self._cache['items']:
-                return self._cache['items'][sku]
-                
-        try:
-            params = {'sku': sku}
-            response = self._make_api_request('GET', 'items', params=params)
-            
-            items = response.get('items', [])
-            for item in items:
-                if item.get('sku', '').upper() == sku.upper():
-                    item_id = item['item_id']
-                    
-                    # Cache it
-                    with self._cache_lock:
-                        self._cache['items'][sku] = item_id
-                        
-                    return item_id
-                    
-        except Exception as e:
-            logger.debug(f"Error finding item by SKU {sku}: {e}")
-            
-        return None
+        logger.info(f"✅ Zoho client initialization complete")
         
-    def _find_item_by_upc(self, upc: str) -> Optional[str]:
-        """Find item by UPC."""
-        try:
-            params = {'upc': upc}
-            response = self._make_api_request('GET', 'items', params=params)
-            
-            items = response.get('items', [])
-            if items:
-                return items[0]['item_id']
-                
-        except Exception as e:
-            logger.debug(f"Error finding item by UPC {upc}: {e}")
-            
-        return None
-        
-    def _find_item_by_field(self, field: str, value: str) -> Optional[str]:
-        """Find item by custom field."""
-        try:
-            # Search with custom field
-            params = {field: value}
-            response = self._make_api_request('GET', 'items', params=params)
-            
-            items = response.get('items', [])
-            if items:
-                return items[0]['item_id']
-                
-        except Exception as e:
-            logger.debug(f"Error finding item by {field} = {value}: {e}")
-            
-        return None
-        
-    def _get_item_details(self, item_id: str) -> Dict:
-        """Get detailed item information."""
-        try:
-            response = self._make_api_request('GET', f'items/{item_id}')
-            return response.get('item', {})
-            
-        except Exception as e:
-            logger.error(f"Failed to get item details for {item_id}: {e}")
-            return {}
-            
-    def _build_adjustment_notes(self, data: Dict) -> str:
-        """Build notes for stock adjustment."""
-        notes = []
-        
-        if data.get('order_number'):
-            notes.append(f"Order #: {data.get('order_number')}")
-            
-        if data.get('vendor_name'):
-            notes.append(f"Vendor: {data.get('vendor_name')}")
-        elif data.get('channel'):
-            notes.append(f"Channel: {data.get('channel')}")
-            
-        if data.get('email_seq_num'):
-            notes.append(f"Email Seq: {data.get('email_seq_num')}")
-            
-        if data.get('confidence_score'):
-            notes.append(f"Confidence: {data.get('confidence_score', 0):.2f}")
-            
-        return ' | '.join(notes)
-        
-    def get_inventory_summary(self) -> Dict:
-        """Get summary of current inventory levels."""
-        logger.info("📊 Generating inventory summary...")
-        
+    def _refresh_access_token(self):
+        """Refresh Zoho access token using refresh token."""
         try:
             response = self._make_api_request('GET', 'items')
             
@@ -332,67 +145,7 @@ def _get_or_create_item_with_sku(self, sku: str, upc: str, product_id: str, name
                 'taxes': self._cache.get('taxes', {}),  # Keep tax config
                 'skus_by_name': {}
             }
-        logger.info("🧹 Cleared entity cache")"""Zoho Inventory client with physical stock tracking and SKU generation."""
-
-import logging
-import requests
-import json
-import hashlib
-from typing import Dict, Optional, List, Tuple
-from datetime import datetime, timedelta
-from functools import lru_cache
-from threading import Lock
-
-logger = logging.getLogger(__name__)
-
-
-class ZohoClient:
-    """Handle Zoho Inventory API with physical stock tracking approach."""
-    
-    def __init__(self, config):
-        self.config = config
-        self.organization_id = config.get('ZOHO_ORGANIZATION_ID')
-        self.access_token = None
-        self.base_url = "https://inventory.zohoapis.com/api/v1"
-        self.api_region = config.get('ZOHO_API_REGION', 'com')
-        
-        # Adjust base URL for region
-        if self.api_region != 'com':
-            self.base_url = f"https://inventory.zohoapis.{self.api_region}/api/v1"
-            
-        # Cache for entities to avoid repeated lookups
-        self._cache = {
-            'items': {},
-            'vendors': {},
-            'customers': {},
-            'taxes': {},
-            'skus_by_name': {}  # Cache SKUs by product name
-        }
-        self._cache_lock = Lock()
-        
-        # Configuration flags - Using physical stock tracking instead of accounting
-        self.use_physical_stock = config.get_bool('ZOHO_USE_PHYSICAL_STOCK', True)
-        self.auto_generate_sku = config.get_bool('ZOHO_AUTO_GENERATE_SKU', True)
-        self.sku_prefix = config.get('ZOHO_SKU_PREFIX', 'AUTO')
-        
-        # Tax configuration
-        self.default_tax_id = config.get('ZOHO_DEFAULT_TAX_ID')
-        self.tax_inclusive = config.get_bool('ZOHO_TAX_INCLUSIVE', False)
-        
-        logger.info(f"🔧 Initializing Zoho client...")
-        logger.info(f"   - Organization ID: {self.organization_id}")
-        logger.info(f"   - API Region: {self.api_region}")
-        logger.info(f"   - Physical Stock Mode: {self.use_physical_stock}")
-        logger.info(f"   - Auto Generate SKU: {self.auto_generate_sku}")
-        
-        self._refresh_access_token()
-        self._load_tax_configuration()
-        
-        logger.info(f"✅ Zoho client initialization complete")
-        
-    def _refresh_access_token(self):
-        """Refresh Zoho access token using refresh token."""
-        try:
+        logger.info("🧹 Cleared entity cache")
             logger.info("🔑 Refreshing Zoho access token...")
             
             url = f"https://accounts.zohoapis.{self.api_region}/oauth/v2/token"
@@ -839,3 +592,252 @@ class ZohoClient:
             logger.error(f"💥 Failed to process sale stock: {e}", exc_info=True)
             
         return result
+        
+    def _get_or_create_item_with_sku(self, sku: str, upc: str, product_id: str, name: str) -> Tuple[str, str]:
+        """
+        Get or create item with intelligent SKU handling.
+        
+        Args:
+            sku: Provided SKU (may be None)
+            upc: UPC if available
+            product_id: Other product identifier
+            name: Product name
+            
+        Returns:
+            Tuple of (item_id, sku_used)
+        """
+        logger.info(f"🔍 Looking up/creating item: {name}")
+        
+        # Try existing identifiers first
+        if sku:
+            logger.info(f"   - Checking existing SKU: {sku}")
+            item_id = self._find_item_by_sku(sku)
+            if item_id:
+                logger.info(f"   ✅ Found existing item by SKU: {item_id}")
+                return item_id, sku
+                
+        if upc:
+            logger.info(f"   - Checking existing UPC: {upc}")
+            item_id = self._find_item_by_upc(upc)
+            if item_id:
+                logger.info(f"   ✅ Found existing item by UPC: {item_id}")
+                return item_id, upc
+                
+        if product_id:
+            logger.info(f"   - Checking existing Product ID: {product_id}")
+            item_id = self._find_item_by_field('product_id', product_id)
+            if item_id:
+                logger.info(f"   ✅ Found existing item by Product ID: {item_id}")
+                return item_id, product_id
+                
+        # Try to find by name
+        with self._cache_lock:
+            if name in self._cache['skus_by_name']:
+                cached_sku = self._cache['skus_by_name'][name]
+                logger.info(f"   - Checking cached SKU by name: {cached_sku}")
+                item_id = self._find_item_by_sku(cached_sku)
+                if item_id:
+                    logger.info(f"   ✅ Found existing item by cached name: {item_id}")
+                    return item_id, cached_sku
+                    
+        # Search for existing item by name
+        try:
+            logger.info(f"   - Searching Zoho for existing item by name...")
+            params = {'name': name}
+            response = self._make_api_request('GET', 'items', params=params)
+            
+            items = response.get('items', [])
+            if items:
+                # Use exact name match
+                for item in items:
+                    if item.get('name', '').lower() == name.lower():
+                        item_id = item['item_id']
+                        item_sku = item.get('sku', '')
+                        
+                        logger.info(f"   ✅ Found existing item by name search: {item_id}")
+                        
+                        # Cache the mapping
+                        with self._cache_lock:
+                            self._cache['skus_by_name'][name] = item_sku
+                            self._cache['items'][item_sku] = item_id
+                            
+                        return item_id, item_sku
+                        
+        except Exception as e:
+            logger.debug(f"   ⚠️ Error searching for item by name: {e}")
+            
+        # Generate SKU if needed
+        if self.auto_generate_sku:
+            generated_sku = self._generate_sku(name, sku, upc, product_id)
+        else:
+            generated_sku = sku or upc or product_id or f"TEMP-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            
+        logger.info(f"   🆕 Creating new item with SKU: {generated_sku}")
+        
+        # Create new item
+        item_data = {
+            'name': name,
+            'sku': generated_sku.upper(),
+            'item_type': 'inventory',
+            'product_type': 'goods',
+            'purchase_rate': 0,
+            'selling_price': 0,
+            'inventory_account_name': 'Inventory Asset',
+            'purchase_account_name': 'Cost of Goods Sold',
+            'initial_stock': 0,
+            'reorder_level': 5,
+            'track_inventory': True
+        }
+        
+        # Add UPC if available
+        if upc:
+            item_data['upc'] = upc
+            
+        try:
+            response = self._make_api_request('POST', 'items', item_data)
+            item_id = response['item']['item_id']
+            
+            # Cache the new item
+            with self._cache_lock:
+                self._cache['items'][generated_sku] = item_id
+                self._cache['skus_by_name'][name] = generated_sku
+                
+            logger.info(f"   ✅ Created new item successfully: {item_id}")
+            return item_id, generated_sku
+            
+        except Exception as e:
+            logger.error(f"   ❌ Failed to create item {name}: {e}")
+            raise
+            
+    def _generate_sku(self, name: str, sku: str = None, upc: str = None, product_id: str = None) -> str:
+        """
+        Generate a SKU for an item.
+        
+        Args:
+            name: Product name
+            sku: Existing SKU if any
+            upc: UPC if available
+            product_id: Other identifier
+            
+        Returns:
+            Generated SKU
+        """
+        if sku:
+            return sku
+            
+        if upc:
+            return f"UPC-{upc}"
+            
+        if product_id:
+            return f"ID-{product_id}"
+            
+        # Generate from name
+        # Clean name for SKU
+        clean_name = ''.join(c for c in name.upper() if c.isalnum() or c in [' ', '-'])
+        words = clean_name.split()
+        
+        # Take first letter of each word (max 4 words)
+        if len(words) > 1:
+            prefix = ''.join(w[0] for w in words[:4])
+        else:
+            # Use first 4 characters if single word
+            prefix = clean_name[:4]
+            
+        # Add hash for uniqueness
+        name_hash = hashlib.md5(name.encode()).hexdigest()[:6].upper()
+        
+        return f"{self.sku_prefix}-{prefix}-{name_hash}"
+        
+    def _find_item_by_sku(self, sku: str) -> Optional[str]:
+        """Find item by SKU."""
+        # Check cache first
+        with self._cache_lock:
+            if sku in self._cache['items']:
+                return self._cache['items'][sku]
+                
+        try:
+            params = {'sku': sku}
+            response = self._make_api_request('GET', 'items', params=params)
+            
+            items = response.get('items', [])
+            for item in items:
+                if item.get('sku', '').upper() == sku.upper():
+                    item_id = item['item_id']
+                    
+                    # Cache it
+                    with self._cache_lock:
+                        self._cache['items'][sku] = item_id
+                        
+                    return item_id
+                    
+        except Exception as e:
+            logger.debug(f"Error finding item by SKU {sku}: {e}")
+            
+        return None
+        
+    def _find_item_by_upc(self, upc: str) -> Optional[str]:
+        """Find item by UPC."""
+        try:
+            params = {'upc': upc}
+            response = self._make_api_request('GET', 'items', params=params)
+            
+            items = response.get('items', [])
+            if items:
+                return items[0]['item_id']
+                
+        except Exception as e:
+            logger.debug(f"Error finding item by UPC {upc}: {e}")
+            
+        return None
+        
+    def _find_item_by_field(self, field: str, value: str) -> Optional[str]:
+        """Find item by custom field."""
+        try:
+            # Search with custom field
+            params = {field: value}
+            response = self._make_api_request('GET', 'items', params=params)
+            
+            items = response.get('items', [])
+            if items:
+                return items[0]['item_id']
+                
+        except Exception as e:
+            logger.debug(f"Error finding item by {field} = {value}: {e}")
+            
+        return None
+        
+    def _get_item_details(self, item_id: str) -> Dict:
+        """Get detailed item information."""
+        try:
+            response = self._make_api_request('GET', f'items/{item_id}')
+            return response.get('item', {})
+            
+        except Exception as e:
+            logger.error(f"Failed to get item details for {item_id}: {e}")
+            return {}
+            
+    def _build_adjustment_notes(self, data: Dict) -> str:
+        """Build notes for stock adjustment."""
+        notes = []
+        
+        if data.get('order_number'):
+            notes.append(f"Order #: {data.get('order_number')}")
+            
+        if data.get('vendor_name'):
+            notes.append(f"Vendor: {data.get('vendor_name')}")
+        elif data.get('channel'):
+            notes.append(f"Channel: {data.get('channel')}")
+            
+        if data.get('email_seq_num'):
+            notes.append(f"Email Seq: {data.get('email_seq_num')}")
+            
+        if data.get('confidence_score'):
+            notes.append(f"Confidence: {data.get('confidence_score', 0):.2f}")
+            
+        return ' | '.join(notes)
+        
+    def get_inventory_summary(self) -> Dict:
+        """Get summary of current inventory levels."""
+        logger.info("📊 Generating inventory summary...")
+        
+        try:
