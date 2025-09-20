@@ -542,7 +542,26 @@ class InventoryReconciliationApp:
         """Run a single iteration of email processing."""
         try:
             logger.info("Checking for new emails...")
+            
+            # Example: Fetch emails with optional date filter
+            # You can uncomment and modify these as needed:
+            
+            # Fetch all unread emails (default)
             new_emails = self.gmail.fetch_unread_emails()
+            
+            # Or fetch unread emails from the last 7 days
+            # from datetime import datetime, timedelta
+            # seven_days_ago = datetime.now() - timedelta(days=7)
+            # new_emails = self.gmail.fetch_unread_emails(since_date=seven_days_ago)
+            
+            # Or fetch unread emails from a specific sender
+            # new_emails = self.gmail.fetch_unread_emails(from_sender="noreply@zoho.com")
+            
+            # Or combine filters
+            # new_emails = self.gmail.fetch_unread_emails(
+            #     since_date=seven_days_ago,
+            #     from_sender="zoho.com"
+            # )
             
             if not new_emails:
                 logger.debug("No new emails found")
