@@ -19,12 +19,12 @@ class ZohoClient:
         self.config = config
         self.organization_id = config.get('ZOHO_ORGANIZATION_ID')
         self.access_token = None
-        self.base_url = "https://inventory.zohoapis.com/api/v1"
+        self.base_url = "https://inventory.zoho.com/api/v1"
         self.api_region = config.get('ZOHO_API_REGION', 'com')
         
         # Adjust base URL for region
         if self.api_region != 'com':
-            self.base_url = f"https://inventory.zohoapis.{self.api_region}/api/v1"
+            self.base_url = f"https://inventory.zoho.{self.api_region}/api/v1"
             
         # Cache for entities to avoid repeated lookups
         self._cache = {
@@ -51,7 +51,7 @@ class ZohoClient:
     def _refresh_access_token(self):
         """Refresh Zoho access token using refresh token."""
         try:
-            url = f"https://accounts.zohoapis.{self.api_region}/oauth/v2/token"
+            url = f"https://accounts.zoho.{self.api_region}/oauth/v2/token"
             data = {
                 "refresh_token": self.config.get('ZOHO_REFRESH_TOKEN'),
                 "client_id": self.config.get('ZOHO_CLIENT_ID'),
