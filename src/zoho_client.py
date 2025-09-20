@@ -21,6 +21,7 @@ class ZohoClient:
         self.access_token = None
         self.base_url = "https://inventory.zohoapis.com/api/v1"
         self.api_region = config.get('ZOHO_API_REGION', 'com')
+        self.is_available = False  # Track if Zoho is available
         
         # Adjust base URL for region
         if self.api_region != 'com':
@@ -47,11 +48,28 @@ class ZohoClient:
         
         logger.info(f"Initializing Zoho client with organization ID: {self.organization_id}")
         
-        self._refresh_access_token()
-        self._load_tax_configuration()
+        # Try to initialize Zoho connection - don't fail if it's not available
+        try:
+            self._refresh_access_token()
+            self._load_tax_configuration()
+            self.is_available = True
+            logger.info("✅ Zoho client initialized successfully")
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError) as e:
+            logger.warning(f"⚠️ Zoho is not available (network/DNS issue): {e}")
+            logger.warning("⚠️ System will continue without Zoho integration")
+            logger.warning("⚠️ Emails will be parsed and saved to Airtable only")
+            self.is_available = False
+        except Exception as e:
+            logger.error(f"❌ Zoho initialization failed: {e}")
+            logger.warning("⚠️ System will continue without Zoho integration")
+            self.is_available = False
         
     def _refresh_access_token(self):
         """Refresh Zoho access token using refresh token."""
+        if not self.is_available:
+            logger.debug("Zoho not available, skipping token refresh")
+            return
+            
         try:
             url = f"https://accounts.zohoapis.{self.api_region}/oauth/v2/token"
             data = {
@@ -61,15 +79,20 @@ class ZohoClient:
                 "grant_type": "refresh_token"
             }
             
-            response = requests.post(url, data=data)
+            response = requests.post(url, data=data, timeout=10)
             response.raise_for_status()
             
             token_data = response.json()
             self.access_token = token_data['access_token']
             logger.info("Refreshed Zoho access token")
             
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError) as e:
+            logger.warning(f"Network issue refreshing Zoho token: {e}")
+            self.is_available = False
+            raise
         except Exception as e:
             logger.error(f"Failed to refresh Zoho token: {str(e)}")
+            self.is_available = False
             raise
             
     def _get_headers(self):
@@ -82,31 +105,48 @@ class ZohoClient:
     def _make_api_request(self, method: str, endpoint: str, data: Optional[Dict] = None, 
                          params: Optional[Dict] = None, retry: bool = True) -> Dict:
         """Make API request with automatic token refresh on 401."""
+        if not self.is_available:
+            raise Exception("Zoho API is not available")
+            
         url = f"{self.base_url}/{endpoint}"
         
         if params is None:
             params = {}
         params['organization_id'] = self.organization_id
         
-        response = requests.request(
-            method=method,
-            url=url,
-            json=data,
-            params=params,
-            headers=self._get_headers()
-        )
-        
-        # Handle token expiration
-        if response.status_code == 401 and retry:
-            logger.info("Token expired, refreshing...")
-            self._refresh_access_token()
-            return self._make_api_request(method, endpoint, data, params, retry=False)
+        try:
+            response = requests.request(
+                method=method,
+                url=url,
+                json=data,
+                params=params,
+                headers=self._get_headers(),
+                timeout=30
+            )
             
-        response.raise_for_status()
-        return response.json()
+            # Handle token expiration
+            if response.status_code == 401 and retry:
+                logger.info("Token expired, refreshing...")
+                self._refresh_access_token()
+                return self._make_api_request(method, endpoint, data, params, retry=False)
+                
+            response.raise_for_status()
+            return response.json()
+            
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError) as e:
+            logger.warning(f"Network issue with Zoho API: {e}")
+            self.is_available = False
+            raise
+        except Exception as e:
+            logger.error(f"Zoho API error for {method} {endpoint}: {e}")
+            raise
         
     def _load_tax_configuration(self):
         """Load tax configuration from Zoho."""
+        if not self.is_available:
+            logger.debug("Zoho not available, skipping tax configuration")
+            return
+            
         try:
             response = self._make_api_request('GET', 'settings/taxes')
             taxes = response.get('taxes', [])
@@ -127,6 +167,11 @@ class ZohoClient:
                 logger.warning(f"Could not load tax configuration: {e}")
                 with self._cache_lock:
                     self._cache['taxes'] = {}
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError) as e:
+            logger.warning(f"Network issue loading tax configuration: {e}")
+            self.is_available = False
+            with self._cache_lock:
+                self._cache['taxes'] = {}
         except Exception as e:
             logger.warning(f"Could not load tax configuration: {e}")
             with self._cache_lock:
@@ -155,6 +200,13 @@ class ZohoClient:
             'warnings': []
         }
         
+        # Check if Zoho is available
+        if not self.is_available:
+            result['errors'].append("Zoho API is not available - network/DNS issue")
+            result['warnings'].append("Data has been saved to Airtable but NOT synced to Zoho")
+            logger.warning("⚠️ Zoho not available - skipping inventory sync")
+            return result
+        
         try:
             if transaction_type == 'purchase':
                 result = self._process_purchase_stock(data)
@@ -163,6 +215,11 @@ class ZohoClient:
             else:
                 result['errors'].append(f"Unknown transaction type: {transaction_type}")
                 
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError) as e:
+            result['errors'].append(f"Network error processing {transaction_type}: {e}")
+            result['warnings'].append("Zoho became unavailable during processing")
+            logger.warning(f"⚠️ Network issue during Zoho processing: {e}")
+            self.is_available = False
         except Exception as e:
             result['errors'].append(str(e))
             logger.error(f"Error processing complete data: {e}")
@@ -422,6 +479,9 @@ class ZohoClient:
         Returns:
             Tuple of (item_id, sku_used)
         """
+        if not self.is_available:
+            raise Exception("Zoho API is not available")
+            
         # Try existing identifiers first
         if sku:
             item_id = self._find_item_by_sku(sku)
@@ -551,6 +611,9 @@ class ZohoClient:
         
     def _find_item_by_sku(self, sku: str) -> Optional[str]:
         """Find item by SKU."""
+        if not self.is_available:
+            return None
+            
         # Check cache first
         with self._cache_lock:
             if sku in self._cache['items']:
@@ -578,6 +641,9 @@ class ZohoClient:
         
     def _find_item_by_upc(self, upc: str) -> Optional[str]:
         """Find item by UPC."""
+        if not self.is_available:
+            return None
+            
         try:
             params = {'upc': upc}
             response = self._make_api_request('GET', 'items', params=params)
@@ -593,6 +659,9 @@ class ZohoClient:
         
     def _find_item_by_field(self, field: str, value: str) -> Optional[str]:
         """Find item by custom field."""
+        if not self.is_available:
+            return None
+            
         try:
             # Search with custom field
             params = {field: value}
@@ -609,6 +678,9 @@ class ZohoClient:
         
     def _get_item_details(self, item_id: str) -> Dict:
         """Get detailed item information."""
+        if not self.is_available:
+            return {}
+            
         try:
             response = self._make_api_request('GET', f'items/{item_id}')
             return response.get('item', {})
@@ -639,6 +711,9 @@ class ZohoClient:
         
     def get_inventory_summary(self) -> Dict:
         """Get summary of current inventory levels."""
+        if not self.is_available:
+            return {'error': 'Zoho API is not available'}
+            
         try:
             response = self._make_api_request('GET', 'items')
             
@@ -676,10 +751,13 @@ class ZohoClient:
             
         except Exception as e:
             logger.error(f"Failed to get inventory summary: {e}")
-            return {}
+            return {'error': str(e)}
             
     def verify_stock_levels(self, sku: str) -> Dict:
         """Verify current stock levels for a specific SKU."""
+        if not self.is_available:
+            return {'error': 'Zoho API is not available'}
+            
         try:
             item_id = self._find_item_by_sku(sku)
             if not item_id:
