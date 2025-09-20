@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Main application with complete data validation and human review workflow.
+Enhanced with detailed pipeline logging.
 """
 
 import os
@@ -18,10 +19,10 @@ from src.airtable_client import AirtableClient
 from src.zoho_client import ZohoClient
 from src.discord_notifier import DiscordNotifier
 
-# Configure logging
+# Configure logging with more detailed formatting
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s',
     handlers=[
         logging.FileHandler('inventory_reconciliation.log'),
         logging.StreamHandler(sys.stdout)
@@ -45,12 +46,46 @@ class InventoryReconciliationApp:
     
     def __init__(self):
         """Initialize all service clients."""
+        logger.info("🚀 Initializing Inventory Reconciliation System...")
+        
         self.config = Config()
-        self.gmail = GmailClient(self.config)
-        self.parser = EmailParser(self.config)
-        self.airtable = AirtableClient(self.config)
-        self.zoho = ZohoClient(self.config)
-        self.discord = DiscordNotifier(self.config)
+        logger.info("✅ Configuration loaded successfully")
+        
+        # Initialize clients with detailed logging
+        try:
+            self.gmail = GmailClient(self.config)
+            logger.info("✅ Gmail client initialized")
+        except Exception as e:
+            logger.error(f"❌ Gmail client initialization failed: {e}")
+            raise
+            
+        try:
+            self.parser = EmailParser(self.config)
+            logger.info(f"✅ OpenAI parser initialized (model: {self.parser.model})")
+        except Exception as e:
+            logger.error(f"❌ OpenAI parser initialization failed: {e}")
+            raise
+            
+        try:
+            self.airtable = AirtableClient(self.config)
+            logger.info("✅ Airtable client initialized")
+        except Exception as e:
+            logger.error(f"❌ Airtable client initialization failed: {e}")
+            raise
+            
+        try:
+            self.zoho = ZohoClient(self.config)
+            logger.info("✅ Zoho client initialized")
+        except Exception as e:
+            logger.error(f"❌ Zoho client initialization failed: {e}")
+            raise
+            
+        try:
+            self.discord = DiscordNotifier(self.config)
+            logger.info("✅ Discord notifier initialized")
+        except Exception as e:
+            logger.error(f"❌ Discord notifier initialization failed: {e}")
+            raise
         
         # Track records pending review
         self.pending_reviews = {}  # airtable_id: data
@@ -69,6 +104,8 @@ class InventoryReconciliationApp:
             'session_start': datetime.now()
         }
         
+        logger.info("🎉 All components initialized successfully!")
+        
     def process_email(self, email_data: Dict) -> None:
         """
         Process email with complete data validation workflow.
@@ -80,62 +117,83 @@ class InventoryReconciliationApp:
         4. If complete -> Sync to Zoho
         5. If incomplete -> Flag for human review
         """
+        seq_num = email_data.get('seq_num', 'unknown')
+        subject = email_data.get('subject', 'No Subject')[:100]
+        
+        logger.info(f"📧 Processing email [seq={seq_num}]: {subject}")
+        
         try:
             self.stats['processed'] += 1
             
             # Step 1: Parse email with OpenAI
-            logger.info(f"Parsing email: {email_data['subject']}")
+            logger.info(f"🤖 Parsing email with OpenAI...")
+            parse_start = time.time()
+            
             parse_result = self.parser.parse_email(
                 email_data['body'],
                 email_data['subject']
             )
             
+            parse_duration = time.time() - parse_start
+            logger.info(f"⏱️ OpenAI parsing completed in {parse_duration:.2f}s")
+            
             # Check parse status
             if parse_result.status == ParseStatus.FAILED:
-                logger.error(f"Failed to parse email: {', '.join(parse_result.errors)}")
+                logger.error(f"❌ OpenAI parsing failed: {', '.join(parse_result.errors)}")
                 self.discord.send_error(
-                    f"Failed to parse email: {email_data['subject'][:100]}",
-                    {'errors': parse_result.errors}
+                    f"Failed to parse email: {subject}",
+                    {'errors': parse_result.errors, 'seq_num': seq_num}
                 )
                 self.stats['errors'] += 1
                 return
                 
             if parse_result.status == ParseStatus.UNKNOWN_TYPE:
-                logger.info(f"Unknown email type, skipping: {email_data['subject']}")
+                logger.info(f"❓ Unknown email type, skipping: {subject}")
                 return
                 
             # Extract parsed data
             parsed_data = parse_result.data
             if not parsed_data:
-                logger.warning(f"No data extracted from email: {email_data['subject']}")
+                logger.warning(f"⚠️ No data extracted from email: {subject}")
                 self.stats['errors'] += 1
                 return
                 
+            transaction_type = parsed_data.get('type', 'unknown')
+            order_number = parsed_data.get('order_number', 'N/A')
+            confidence = parse_result.confidence_score
+            
+            logger.info(f"📊 Parse Results:")
+            logger.info(f"  - Type: {transaction_type}")
+            logger.info(f"  - Order: {order_number}")
+            logger.info(f"  - Status: {parse_result.status.value}")
+            logger.info(f"  - Completeness: {parse_result.completeness.value}")
+            logger.info(f"  - Confidence: {confidence:.2f}")
+            
+            if parse_result.missing_fields:
+                logger.info(f"  - Missing fields: {', '.join(parse_result.missing_fields)}")
+            
             # Add email metadata (using sequence number instead of UID)
-            parsed_data['email_seq_num'] = email_data.get('seq_num')
+            parsed_data['email_seq_num'] = seq_num
             parsed_data['email_date'] = email_data['date']
             parsed_data['parse_result'] = parse_result.to_dict()
             
-            # Step 2: Check completeness
-            transaction_type = parsed_data.get('type')
-            
+            # Step 2: Check completeness and route accordingly
             if parse_result.completeness == DataCompleteness.COMPLETE:
-                # Complete data workflow
+                logger.info(f"✅ Data is COMPLETE - proceeding with full pipeline")
                 self._process_complete_data(parsed_data, parse_result, transaction_type)
                 self.stats['complete_data'] += 1
                 
             elif parse_result.completeness == DataCompleteness.INCOMPLETE:
-                # Incomplete data workflow
+                logger.info(f"⚠️ Data is INCOMPLETE - saving to Airtable for review")
                 self._process_incomplete_data(parsed_data, parse_result, transaction_type)
                 self.stats['incomplete_data'] += 1
                 
             else:
-                # Invalid data
-                logger.error(f"Invalid data completeness: {parse_result.completeness}")
+                logger.error(f"❌ Invalid data completeness: {parse_result.completeness}")
                 self.stats['errors'] += 1
                 
         except Exception as e:
-            error_msg = f"Error processing email {email_data.get('seq_num')}: {str(e)}"
+            error_msg = f"💥 Error processing email [seq={seq_num}]: {str(e)}"
             logger.error(error_msg, exc_info=True)
             self.discord.send_error(error_msg, email_data)
             self.stats['errors'] += 1
@@ -147,9 +205,13 @@ class InventoryReconciliationApp:
         2. Sync to Zoho
         3. Send success notification
         """
+        order_number = data.get('order_number', 'N/A')
+        
         try:
             # Step 1: Save to Airtable
-            logger.info(f"Saving complete {transaction_type} to Airtable")
+            logger.info(f"💾 Saving complete {transaction_type} to Airtable...")
+            airtable_start = time.time()
+            
             data['processing_status'] = ProcessingStatus.COMPLETE.value
             data['requires_review'] = False
             data['completeness'] = parse_result.completeness.value
@@ -159,31 +221,49 @@ class InventoryReconciliationApp:
             else:
                 airtable_record = self.airtable.create_sale(data)
                 
+            airtable_duration = time.time() - airtable_start
             airtable_id = airtable_record.get('id')
             
+            logger.info(f"✅ Airtable save completed in {airtable_duration:.2f}s")
+            logger.info(f"   - Record ID: {airtable_id}")
+            
             # Step 2: Sync to Zoho
-            logger.info(f"Syncing complete {transaction_type} to Zoho")
+            logger.info(f"🔄 Syncing complete {transaction_type} to Zoho Inventory...")
+            zoho_start = time.time()
+            
             zoho_result = self.zoho.process_complete_data(data, transaction_type)
+            zoho_duration = time.time() - zoho_start
+            
+            logger.info(f"⏱️ Zoho sync completed in {zoho_duration:.2f}s")
             
             if zoho_result.get('success'):
                 data['processing_status'] = ProcessingStatus.SYNCED.value
                 self.stats['synced_to_zoho'] += 1
                 
-                # Update Airtable with sync status
-                if airtable_id:
-                    # self.airtable.update_record(airtable_id, {'zoho_synced': True})
-                    pass
-                    
+                logger.info(f"✅ Zoho sync SUCCESS:")
+                logger.info(f"   - Stock adjusted: {zoho_result.get('stock_adjusted', False)}")
+                logger.info(f"   - Items processed: {len(zoho_result.get('items_processed', []))}")
+                logger.info(f"   - Adjustment ID: {zoho_result.get('adjustment_id', 'N/A')}")
+                
+                if zoho_result.get('warnings'):
+                    logger.warning(f"⚠️ Zoho warnings: {'; '.join(zoho_result['warnings'][:3])}")
+                
                 # Send success notification
                 self._send_complete_success_notification(data, parse_result, zoho_result, transaction_type)
                 
             else:
-                # Zoho sync failed
-                logger.error(f"Zoho sync failed: {zoho_result.get('errors')}")
+                logger.error(f"❌ Zoho sync FAILED:")
+                for error in zoho_result.get('errors', [])[:3]:
+                    logger.error(f"   - {error}")
+                    
+                if zoho_result.get('items_failed'):
+                    logger.error(f"   - Failed items: {len(zoho_result['items_failed'])}")
+                    
                 self._send_zoho_failure_notification(data, zoho_result, transaction_type)
                 
         except Exception as e:
-            logger.error(f"Error processing complete data: {e}")
+            error_msg = f"💥 Error processing complete data for {order_number}: {e}"
+            logger.error(error_msg, exc_info=True)
             self.discord.send_error(f"Failed to process complete {transaction_type}: {str(e)}")
             
     def _process_incomplete_data(self, data: Dict, parse_result: ParseResult, transaction_type: str):
@@ -194,9 +274,13 @@ class InventoryReconciliationApp:
         3. Send review required notification
         4. Track for review completion
         """
+        order_number = data.get('order_number', 'N/A')
+        
         try:
             # Step 1: Save to Airtable with incomplete status
-            logger.info(f"Saving incomplete {transaction_type} to Airtable for review")
+            logger.info(f"💾 Saving incomplete {transaction_type} to Airtable for review...")
+            airtable_start = time.time()
+            
             data['processing_status'] = ProcessingStatus.INCOMPLETE.value
             data['requires_review'] = True
             data['completeness'] = parse_result.completeness.value
@@ -207,7 +291,12 @@ class InventoryReconciliationApp:
             else:
                 airtable_record = self.airtable.create_sale(data)
                 
+            airtable_duration = time.time() - airtable_start
             airtable_id = airtable_record.get('id')
+            
+            logger.info(f"✅ Airtable save completed in {airtable_duration:.2f}s")
+            logger.info(f"   - Record ID: {airtable_id}")
+            logger.info(f"   - Status: REQUIRES_REVIEW")
             
             # Track for review
             if airtable_id:
@@ -219,7 +308,12 @@ class InventoryReconciliationApp:
                 }
                 self.stats['pending_review'] += 1
                 
+                logger.info(f"📋 Added to review queue:")
+                logger.info(f"   - Missing: {', '.join(parse_result.missing_fields[:5])}")
+                logger.info(f"   - Total pending: {self.stats['pending_review']}")
+                
             # Step 2: Send human review notification
+            logger.info(f"📢 Sending review notification to Discord...")
             self._send_review_required_notification(
                 data, 
                 parse_result, 
@@ -227,8 +321,11 @@ class InventoryReconciliationApp:
                 airtable_id
             )
             
+            logger.info(f"🚫 SKIPPING Zoho sync - data incomplete")
+            
         except Exception as e:
-            logger.error(f"Error processing incomplete data: {e}")
+            error_msg = f"💥 Error processing incomplete data for {order_number}: {e}"
+            logger.error(error_msg, exc_info=True)
             self.discord.send_error(f"Failed to process incomplete {transaction_type}: {str(e)}")
             
     def handle_review_complete(self, airtable_id: str):
@@ -236,17 +333,20 @@ class InventoryReconciliationApp:
         Handle when human review is complete.
         Re-validate data and sync to Zoho if now complete.
         """
+        logger.info(f"🔄 Processing review completion for record: {airtable_id}")
+        
         try:
             if airtable_id not in self.pending_reviews:
-                logger.warning(f"No pending review found for {airtable_id}")
+                logger.warning(f"❓ No pending review found for {airtable_id}")
                 self.discord.send_warning(f"No pending review found for Airtable ID: {airtable_id}")
                 return
                 
             review_info = self.pending_reviews[airtable_id]
             transaction_type = review_info['type']
             
+            logger.info(f"📝 Re-validating {transaction_type} data after review...")
+            
             # Fetch updated data from Airtable
-            logger.info(f"Fetching updated data from Airtable for {airtable_id}")
             # updated_data = self.airtable.get_record(airtable_id, transaction_type)
             # For now, using the stored data (would need to implement get_record)
             updated_data = review_info['data']
@@ -255,8 +355,7 @@ class InventoryReconciliationApp:
             validation_result = self._validate_data_completeness(updated_data, transaction_type)
             
             if validation_result['is_complete']:
-                # Data is now complete, sync to Zoho
-                logger.info(f"Review complete, syncing {transaction_type} to Zoho")
+                logger.info(f"✅ Data is now complete! Syncing to Zoho...")
                 
                 zoho_result = self.zoho.process_complete_data(updated_data, transaction_type)
                 
@@ -269,6 +368,8 @@ class InventoryReconciliationApp:
                     del self.pending_reviews[airtable_id]
                     self.stats['pending_review'] -= 1
                     
+                    logger.info(f"🎉 Review complete & synced successfully!")
+                    
                     # Send success notification
                     self.discord.send_success(
                         f"✅ Review Complete & Synced to Zoho\n"
@@ -278,13 +379,14 @@ class InventoryReconciliationApp:
                         f"Stock adjusted: {'Yes' if zoho_result.get('stock_adjusted') else 'No'}"
                     )
                 else:
-                    # Zoho sync failed after review
+                    logger.error(f"❌ Zoho sync failed after review completion")
                     self.discord.send_error(
                         f"❌ Zoho sync failed after review\n"
                         f"Errors: {', '.join(zoho_result.get('errors', []))}"
                     )
             else:
-                # Still incomplete after review
+                logger.warning(f"⚠️ Data still incomplete after review")
+                logger.warning(f"   - Still missing: {', '.join(validation_result.get('missing_fields', []))}")
                 self.discord.send_warning(
                     f"⚠️ Data still incomplete after review\n"
                     f"Missing fields: {', '.join(validation_result.get('missing_fields', []))}\n"
@@ -292,7 +394,8 @@ class InventoryReconciliationApp:
                 )
                 
         except Exception as e:
-            logger.error(f"Error handling review completion: {e}")
+            error_msg = f"💥 Error handling review completion: {e}"
+            logger.error(error_msg, exc_info=True)
             self.discord.send_error(f"Failed to process review completion: {str(e)}")
             
     def _validate_data_completeness(self, data: Dict, transaction_type: str) -> Dict:
@@ -543,95 +646,135 @@ class InventoryReconciliationApp:
     def run_once(self) -> None:
         """Run a single iteration of email processing."""
         try:
-            logger.info("Checking for new emails...")
+            logger.info("🔍 Checking for new emails...")
             
-            # Example: Fetch emails with optional date filter
-            # You can uncomment and modify these as needed:
-            
-            # Fetch all unread emails (default)
+            # Fetch all unread emails
             new_emails = self.gmail.fetch_unread_emails()
             
-            # Or fetch unread emails from the last 7 days
-            # from datetime import datetime, timedelta
-            # seven_days_ago = datetime.now() - timedelta(days=7)
-            # new_emails = self.gmail.fetch_unread_emails(since_date=seven_days_ago)
-            
-            # Or fetch unread emails from a specific sender
-            # new_emails = self.gmail.fetch_unread_emails(from_sender="noreply@zoho.com")
-            
-            # Or combine filters
-            # new_emails = self.gmail.fetch_unread_emails(
-            #     since_date=seven_days_ago,
-            #     from_sender="zoho.com"
-            # )
-            
             if not new_emails:
-                logger.debug("No new emails found")
+                logger.info("📭 No new emails found")
                 return
                 
-            logger.info(f"Found {len(new_emails)} new emails")
+            logger.info(f"📬 Found {len(new_emails)} new emails to process")
             
-            for email in new_emails:
+            for i, email in enumerate(new_emails, 1):
                 seq_num = email.get('seq_num')
+                subject = email.get('subject', 'No Subject')[:100]
+                
+                logger.info(f"📧 [{i}/{len(new_emails)}] Processing email [seq={seq_num}]: {subject}")
+                
                 if seq_num and seq_num not in self.processed_seq_nums:
+                    # Process the email
                     self.process_email(email)
-                    self.processed_seq_nums.add(seq_num)
-                    self.gmail.mark_as_processed(seq_num)
+                    
+                    # Mark as processed in Gmail
+                    logger.info(f"🏷️ Marking email [seq={seq_num}] as processed in Gmail...")
+                    mark_success = self.gmail.mark_as_processed(seq_num)
+                    
+                    if mark_success:
+                        logger.info(f"✅ Email [seq={seq_num}] successfully marked as processed")
+                        self.processed_seq_nums.add(seq_num)
+                    else:
+                        logger.warning(f"⚠️ Failed to mark email [seq={seq_num}] as processed in Gmail")
+                        # Still add to processed set to avoid reprocessing
+                        self.processed_seq_nums.add(seq_num)
+                        
+                else:
+                    logger.info(f"⏭️ Email [seq={seq_num}] already processed, skipping")
+                    
+            logger.info(f"✅ Completed processing {len(new_emails)} emails")
                     
         except Exception as e:
-            error_msg = f"Error in run cycle: {str(e)}"
+            error_msg = f"💥 Error in run cycle: {str(e)}"
             logger.error(error_msg, exc_info=True)
             self.discord.send_error(error_msg)
             
     def run(self) -> None:
         """Main run loop."""
-        logger.info("Starting Inventory Reconciliation App with Complete Data Validation")
+        logger.info("🚀 Starting Inventory Reconciliation App with Complete Data Validation")
         
         # Send startup notification
         self.discord.send_info(
             "🚀 Inventory Reconciliation System Started\n"
             "Mode: Complete Data Validation\n"
-            "Incomplete data will be flagged for human review",
+            "✅ Enhanced logging enabled\n"
+            "⚠️ Incomplete data will be flagged for human review",
             title="System Started"
         )
         
         poll_interval = self.config.get_int('POLL_INTERVAL')
+        logger.info(f"⏰ Email polling interval: {poll_interval} seconds")
         
         try:
+            cycle_count = 0
             while True:
                 try:
+                    cycle_count += 1
+                    logger.info(f"🔄 Starting email check cycle #{cycle_count}")
+                    
+                    cycle_start = time.time()
                     self.run_once()
+                    cycle_duration = time.time() - cycle_start
+                    
+                    logger.info(f"⏱️ Cycle #{cycle_count} completed in {cycle_duration:.2f}s")
                     
                     # Periodic status report
                     if self.stats['processed'] > 0 and self.stats['processed'] % 50 == 0:
+                        logger.info(f"📊 Milestone reached: {self.stats['processed']} emails processed")
                         self._send_status_report()
                         
-                    logger.debug(f"Sleeping for {poll_interval} seconds")
+                    logger.info(f"😴 Sleeping for {poll_interval} seconds until next cycle...")
                     time.sleep(poll_interval)
                     
                 except KeyboardInterrupt:
-                    logger.info("Shutdown requested")
+                    logger.info("🛑 Shutdown requested by user")
                     break
                     
                 except Exception as e:
-                    logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+                    logger.error(f"💥 Unexpected error in cycle #{cycle_count}: {str(e)}", exc_info=True)
                     self.stats['errors'] += 1
+                    
+                    # Send error notification but continue running
+                    self.discord.send_error(f"Cycle #{cycle_count} error: {str(e)}")
+                    
+                    logger.info(f"⏰ Waiting {poll_interval}s before retry...")
                     time.sleep(poll_interval)
                     
         finally:
             # Cleanup
-            logger.info("Cleaning up resources...")
-            self.gmail.close()
+            logger.info("🧹 Cleaning up resources...")
+            
+            try:
+                self.gmail.close()
+                logger.info("✅ Gmail connection closed")
+            except Exception as e:
+                logger.error(f"❌ Error closing Gmail connection: {e}")
             
             # Send final report
+            logger.info("📊 Generating final session report...")
             self._send_status_report()
             
             # List any remaining pending reviews
             if self.pending_reviews:
+                logger.info(f"📋 {len(self.pending_reviews)} reviews still pending")
                 self._send_pending_reviews_report()
+            else:
+                logger.info("✅ No pending reviews")
                 
-            self.discord.send_info("ℹ️ System stopped", title="Shutdown")
-            logger.info("Shutdown complete")
+            # Send shutdown notification
+            runtime = (datetime.now() - self.stats['session_start']).total_seconds()
+            shutdown_message = (
+                f"🛑 **System Shutdown**\n\n"
+                f"**Final Statistics:**\n"
+                f"• Total Runtime: {runtime/3600:.2f} hours\n"
+                f"• Emails Processed: {self.stats['processed']}\n"
+                f"• Successfully Synced: {self.stats['synced_to_zoho']}\n"
+                f"• Pending Review: {self.stats['pending_review']}\n"
+                f"• Total Errors: {self.stats['errors']}"
+            )
+            
+            self.discord.send_info(shutdown_message, title="System Stopped")
+            logger.info("🏁 Shutdown complete")
 
 
 if __name__ == "__main__":
