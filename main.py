@@ -8,7 +8,7 @@ import time
 import logging
 import sys
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 from enum import Enum
 
 from src.config import Config
@@ -54,7 +54,9 @@ class InventoryReconciliationApp:
         
         # Track records pending review
         self.pending_reviews = {}  # airtable_id: data
-        self.processed_uids = set()
+        
+        # Track processed emails by sequence number
+        self.processed_seq_nums: Set[str] = set()
         
         # Statistics tracking
         self.stats = {
@@ -133,7 +135,7 @@ class InventoryReconciliationApp:
                 self.stats['errors'] += 1
                 
         except Exception as e:
-            error_msg = f"Error processing email {email_data.get('uid')}: {str(e)}"
+            error_msg = f"Error processing email {email_data.get('seq_num')}: {str(e)}"
             logger.error(error_msg, exc_info=True)
             self.discord.send_error(error_msg, email_data)
             self.stats['errors'] += 1
@@ -628,7 +630,7 @@ class InventoryReconciliationApp:
             if self.pending_reviews:
                 self._send_pending_reviews_report()
                 
-            self.discord.send_info("⏹️ System stopped", title="Shutdown")
+            self.discord.send_info("ℹ️ System stopped", title="Shutdown")
             logger.info("Shutdown complete")
 
 
