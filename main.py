@@ -75,7 +75,11 @@ class InventoryReconciliationApp:
             
         try:
             self.zoho = ZohoClient(self.config)
-            logger.info("✅ Zoho client initialized")
+            if self.zoho.is_available:
+                logger.info("✅ Zoho client initialized")
+            else:
+                logger.warning("⚠️ Zoho client initialized but API is unavailable")
+                logger.warning("   System will continue with Airtable-only mode")
         except Exception as e:
             logger.error(f"❌ Zoho client initialization failed: {e}")
             raise
@@ -228,38 +232,45 @@ class InventoryReconciliationApp:
             logger.info(f"   - Record ID: {airtable_id}")
             
             # Step 2: Sync to Zoho
-            logger.info(f"🔄 Syncing complete {transaction_type} to Zoho Inventory...")
-            zoho_start = time.time()
-            
-            zoho_result = self.zoho.process_complete_data(data, transaction_type)
-            zoho_duration = time.time() - zoho_start
-            
-            logger.info(f"⏱️ Zoho sync completed in {zoho_duration:.2f}s")
-            
-            if zoho_result.get('success'):
-                data['processing_status'] = ProcessingStatus.SYNCED.value
-                self.stats['synced_to_zoho'] += 1
+            if self.zoho.is_available:
+                logger.info(f"🔄 Syncing complete {transaction_type} to Zoho Inventory...")
+                zoho_start = time.time()
                 
-                logger.info(f"✅ Zoho sync SUCCESS:")
-                logger.info(f"   - Stock adjusted: {zoho_result.get('stock_adjusted', False)}")
-                logger.info(f"   - Items processed: {len(zoho_result.get('items_processed', []))}")
-                logger.info(f"   - Adjustment ID: {zoho_result.get('adjustment_id', 'N/A')}")
+                zoho_result = self.zoho.process_complete_data(data, transaction_type)
+                zoho_duration = time.time() - zoho_start
                 
-                if zoho_result.get('warnings'):
-                    logger.warning(f"⚠️ Zoho warnings: {'; '.join(zoho_result['warnings'][:3])}")
+                logger.info(f"⏱️ Zoho sync completed in {zoho_duration:.2f}s")
                 
-                # Send success notification
-                self._send_complete_success_notification(data, parse_result, zoho_result, transaction_type)
-                
+                if zoho_result.get('success'):
+                    data['processing_status'] = ProcessingStatus.SYNCED.value
+                    self.stats['synced_to_zoho'] += 1
+                    
+                    logger.info(f"✅ Zoho sync SUCCESS:")
+                    logger.info(f"   - Stock adjusted: {zoho_result.get('stock_adjusted', False)}")
+                    logger.info(f"   - Items processed: {len(zoho_result.get('items_processed', []))}")
+                    logger.info(f"   - Adjustment ID: {zoho_result.get('adjustment_id', 'N/A')}")
+                    
+                    if zoho_result.get('warnings'):
+                        logger.warning(f"⚠️ Zoho warnings: {'; '.join(zoho_result['warnings'][:3])}")
+                    
+                    # Send success notification
+                    self._send_complete_success_notification(data, parse_result, zoho_result, transaction_type)
+                    
+                else:
+                    logger.error(f"❌ Zoho sync FAILED:")
+                    for error in zoho_result.get('errors', [])[:3]:
+                        logger.error(f"   - {error}")
+                        
+                    if zoho_result.get('items_failed'):
+                        logger.error(f"   - Failed items: {len(zoho_result['items_failed'])}")
+                        
+                    self._send_zoho_failure_notification(data, zoho_result, transaction_type)
             else:
-                logger.error(f"❌ Zoho sync FAILED:")
-                for error in zoho_result.get('errors', [])[:3]:
-                    logger.error(f"   - {error}")
-                    
-                if zoho_result.get('items_failed'):
-                    logger.error(f"   - Failed items: {len(zoho_result['items_failed'])}")
-                    
-                self._send_zoho_failure_notification(data, zoho_result, transaction_type)
+                logger.warning(f"⚠️ Zoho unavailable - skipping inventory sync")
+                logger.warning(f"   Data saved to Airtable only")
+                
+                # Send notification about Airtable-only processing
+                self._send_airtable_only_notification(data, parse_result, transaction_type)
                 
         except Exception as e:
             error_msg = f"💥 Error processing complete data for {order_number}: {e}"
@@ -566,6 +577,43 @@ class InventoryReconciliationApp:
         message += f"\n**Note:** Data has been saved to Airtable but NOT synced to Zoho inventory."
         
         self.discord.send_error(message, title="Zoho Sync Failed")
+        
+    def _send_airtable_only_notification(self, data: Dict, parse_result: ParseResult, transaction_type: str):
+        """Send notification when data is saved to Airtable only (Zoho unavailable)."""
+        if transaction_type == 'purchase':
+            message = (
+                f"💾 **Purchase Saved to Airtable Only**\n"
+                f"Order #: {data.get('order_number', 'N/A')}\n"
+                f"Vendor: {data.get('vendor_name', 'Unknown')}\n"
+                f"Date: {data.get('date', 'N/A')}\n"
+                f"Items: {len(data.get('items', []))}\n"
+                f"Subtotal: ${data.get('subtotal', 0):.2f}\n"
+                f"Tax: ${data.get('taxes', 0):.2f}\n"
+                f"Total: ${data.get('total', 0):.2f}\n\n"
+                f"⚠️ **Zoho Status:**\n"
+                f"• Zoho API: Unavailable (network/DNS issue)\n"
+                f"• Stock Sync: Skipped\n"
+                f"• Data Location: Airtable only\n\n"
+                f"**Note:** Data will sync to Zoho when API becomes available."
+            )
+        else:
+            message = (
+                f"💾 **Sale Saved to Airtable Only**\n"
+                f"Order #: {data.get('order_number', 'N/A')}\n"
+                f"Channel: {data.get('channel', 'Unknown')}\n"
+                f"Date: {data.get('date', 'N/A')}\n"
+                f"Items: {len(data.get('items', []))}\n"
+                f"Subtotal: ${data.get('subtotal', 0):.2f}\n"
+                f"Tax: ${data.get('taxes', 0):.2f}\n"
+                f"Total: ${data.get('total', 0):.2f}\n\n"
+                f"⚠️ **Zoho Status:**\n"
+                f"• Zoho API: Unavailable (network/DNS issue)\n"
+                f"• Stock Sync: Skipped\n"
+                f"• Data Location: Airtable only\n\n"
+                f"**Note:** Data will sync to Zoho when API becomes available."
+            )
+            
+        self.discord.send_warning(message, title="Airtable-Only Processing")
         
     def process_discord_command(self, command: str, args: List[str]):
         """
