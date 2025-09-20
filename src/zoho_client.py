@@ -45,109 +45,14 @@ class ZohoClient:
         self.default_tax_id = config.get('ZOHO_DEFAULT_TAX_ID')
         self.tax_inclusive = config.get_bool('ZOHO_TAX_INCLUSIVE', False)
         
-        logger.info(f"🔧 Initializing Zoho client...")
-        logger.info(f"   - Organization ID: {self.organization_id}")
-        logger.info(f"   - API Region: {self.api_region}")
-        logger.info(f"   - Physical Stock Mode: {self.use_physical_stock}")
-        logger.info(f"   - Auto Generate SKU: {self.auto_generate_sku}")
+        logger.info(f"Initializing Zoho client with organization ID: {self.organization_id}")
         
         self._refresh_access_token()
         self._load_tax_configuration()
         
-        logger.info(f"✅ Zoho client initialization complete")
-        
     def _refresh_access_token(self):
         """Refresh Zoho access token using refresh token."""
         try:
-            response = self._make_api_request('GET', 'items')
-            
-            summary = {
-                'total_items': 0,
-                'total_stock_value': 0,
-                'low_stock_items': [],
-                'out_of_stock_items': []
-            }
-            
-            for item in response.get('items', []):
-                if item.get('item_type') == 'inventory':
-                    summary['total_items'] += 1
-                    
-                    stock = item.get('stock_on_hand', 0)
-                    rate = item.get('purchase_rate', 0)
-                    reorder_level = item.get('reorder_level', 0)
-                    
-                    summary['total_stock_value'] += stock * rate
-                    
-                    if stock == 0:
-                        summary['out_of_stock_items'].append({
-                            'name': item.get('name'),
-                            'sku': item.get('sku')
-                        })
-                    elif stock <= reorder_level:
-                        summary['low_stock_items'].append({
-                            'name': item.get('name'),
-                            'sku': item.get('sku'),
-                            'stock': stock,
-                            'reorder_level': reorder_level
-                        })
-                        
-            logger.info(f"✅ Inventory summary generated:")
-            logger.info(f"   - Total items: {summary['total_items']}")
-            logger.info(f"   - Total value: ${summary['total_stock_value']:.2f}")
-            logger.info(f"   - Out of stock: {len(summary['out_of_stock_items'])}")
-            logger.info(f"   - Low stock: {len(summary['low_stock_items'])}")
-            
-            return summary
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to get inventory summary: {e}")
-            return {}
-            
-    def verify_stock_levels(self, sku: str) -> Dict:
-        """Verify current stock levels for a specific SKU."""
-        logger.info(f"🔍 Verifying stock levels for SKU: {sku}")
-        
-        try:
-            item_id = self._find_item_by_sku(sku)
-            if not item_id:
-                return {'error': f"SKU {sku} not found"}
-                
-            item = self._get_item_details(item_id)
-            
-            result = {
-                'sku': item.get('sku'),
-                'name': item.get('name'),
-                'stock_on_hand': item.get('stock_on_hand', 0),
-                'available_stock': item.get('available_stock', 0),
-                'purchase_rate': item.get('purchase_rate', 0),
-                'selling_price': item.get('selling_price', 0),
-                'reorder_level': item.get('reorder_level', 0),
-                'stock_value': item.get('stock_on_hand', 0) * item.get('purchase_rate', 0)
-            }
-            
-            logger.info(f"✅ Stock verification complete:")
-            logger.info(f"   - Stock on hand: {result['stock_on_hand']}")
-            logger.info(f"   - Stock value: ${result['stock_value']:.2f}")
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to verify stock for {sku}: {e}")
-            return {'error': str(e)}
-            
-    def clear_cache(self):
-        """Clear the entity cache."""
-        with self._cache_lock:
-            self._cache = {
-                'items': {},
-                'vendors': {},
-                'customers': {},
-                'taxes': self._cache.get('taxes', {}),  # Keep tax config
-                'skus_by_name': {}
-            }
-        logger.info("🧹 Cleared entity cache")
-            logger.info("🔑 Refreshing Zoho access token...")
-            
             url = f"https://accounts.zohoapis.{self.api_region}/oauth/v2/token"
             data = {
                 "refresh_token": self.config.get('ZOHO_REFRESH_TOKEN'),
@@ -161,11 +66,10 @@ class ZohoClient:
             
             token_data = response.json()
             self.access_token = token_data['access_token']
-            
-            logger.info("✅ Zoho access token refreshed successfully")
+            logger.info("Refreshed Zoho access token")
             
         except Exception as e:
-            logger.error(f"❌ Failed to refresh Zoho token: {str(e)}")
+            logger.error(f"Failed to refresh Zoho token: {str(e)}")
             raise
             
     def _get_headers(self):
@@ -184,72 +88,50 @@ class ZohoClient:
             params = {}
         params['organization_id'] = self.organization_id
         
-        try:
-            response = requests.request(
-                method=method,
-                url=url,
-                json=data,
-                params=params,
-                headers=self._get_headers(),
-                timeout=30
-            )
+        response = requests.request(
+            method=method,
+            url=url,
+            json=data,
+            params=params,
+            headers=self._get_headers()
+        )
+        
+        # Handle token expiration
+        if response.status_code == 401 and retry:
+            logger.info("Token expired, refreshing...")
+            self._refresh_access_token()
+            return self._make_api_request(method, endpoint, data, params, retry=False)
             
-            # Handle token expiration
-            if response.status_code == 401 and retry:
-                logger.info("🔑 Token expired, refreshing...")
-                self._refresh_access_token()
-                return self._make_api_request(method, endpoint, data, params, retry=False)
-                
-            response.raise_for_status()
-            return response.json()
-            
-        except requests.exceptions.Timeout:
-            logger.error(f"⏰ Zoho API timeout for {method} {endpoint}")
-            raise
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"🌐 Zoho API HTTP error for {method} {endpoint}: {e}")
-            logger.error(f"Response: {response.text if 'response' in locals() else 'No response'}")
-            raise
-        except Exception as e:
-            logger.error(f"💥 Zoho API error for {method} {endpoint}: {e}")
-            raise
+        response.raise_for_status()
+        return response.json()
         
     def _load_tax_configuration(self):
-        """Load tax configuration from Zoho with better error handling."""
+        """Load tax configuration from Zoho."""
         try:
-            logger.info("🧾 Loading tax configuration from Zoho...")
-            
             response = self._make_api_request('GET', 'settings/taxes')
             taxes = response.get('taxes', [])
             
             with self._cache_lock:
                 self._cache['taxes'] = {tax['tax_id']: tax for tax in taxes}
                 
-            logger.info(f"✅ Loaded {len(taxes)} tax configurations")
+            logger.info(f"Loaded {len(taxes)} tax configurations")
             
-            if taxes:
-                # Log available taxes for debugging
-                for tax in taxes[:3]:  # Show first 3
-                    logger.info(f"   - {tax.get('tax_name', 'Unknown')}: {tax.get('tax_percentage', 0)}%")
-                    
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 400:
-                logger.warning("⚠️ Could not load tax configuration (400 error)")
-                logger.warning("   This might be due to API permissions or organization setup")
-                logger.warning("   Tax operations will use default settings")
-                # Don't raise - continue without tax config
+            if e.response and e.response.status_code == 400:
+                logger.warning("Could not load tax configuration: 400 Client Error")
+                logger.warning("This might be due to API permissions or organization setup")
+                logger.warning("Tax operations will use default settings")
                 with self._cache_lock:
                     self._cache['taxes'] = {}
             else:
-                logger.error(f"❌ HTTP error loading tax configuration: {e}")
-                raise
+                logger.warning(f"Could not load tax configuration: {e}")
+                with self._cache_lock:
+                    self._cache['taxes'] = {}
         except Exception as e:
-            logger.warning(f"⚠️ Could not load tax configuration: {e}")
-            logger.warning("   Continuing without tax configuration")
-            # Don't raise - continue without tax config
+            logger.warning(f"Could not load tax configuration: {e}")
             with self._cache_lock:
                 self._cache['taxes'] = {}
-            
+                
     def process_complete_data(self, data: Dict, transaction_type: str) -> Dict:
         """
         Process complete data using physical stock adjustments.
@@ -262,8 +144,7 @@ class ZohoClient:
         Returns:
             Dictionary with processing results
         """
-        order_number = data.get('order_number', 'N/A')
-        logger.info(f"🔄 Processing complete {transaction_type} data for order: {order_number}")
+        logger.info(f"Processing complete {transaction_type} data for order: {data.get('order_number', 'N/A')}")
         
         result = {
             'success': False,
@@ -281,11 +162,10 @@ class ZohoClient:
                 result = self._process_sale_stock(data)
             else:
                 result['errors'].append(f"Unknown transaction type: {transaction_type}")
-                logger.error(f"❌ Unknown transaction type: {transaction_type}")
                 
         except Exception as e:
             result['errors'].append(str(e))
-            logger.error(f"💥 Error processing complete data: {e}", exc_info=True)
+            logger.error(f"Error processing complete data: {e}")
             
         return result
         
@@ -299,12 +179,7 @@ class ZohoClient:
         Returns:
             Processing result dictionary
         """
-        order_number = data.get('order_number', 'N/A')
-        vendor = data.get('vendor_name', 'Unknown')
-        
-        logger.info(f"📦 Processing purchase stock adjustment:")
-        logger.info(f"   - Order: {order_number}")
-        logger.info(f"   - Vendor: {vendor}")
+        logger.info(f"Processing purchase stock adjustment for vendor: {data.get('vendor_name', 'Unknown')}")
         
         result = {
             'success': False,
@@ -321,86 +196,66 @@ class ZohoClient:
             adjustment_items = []
             total_cost = 0
             
-            items = data.get('items', [])
-            logger.info(f"📋 Processing {len(items)} items...")
-            
-            for i, item in enumerate(items, 1):
-                item_name = item.get('name', f'Item {i}')
-                logger.info(f"   [{i}/{len(items)}] Processing: {item_name}")
-                
+            for item in data.get('items', []):
                 try:
                     # Get or create item with SKU
                     item_id, sku_used = self._get_or_create_item_with_sku(
                         item.get('sku'),
                         item.get('upc'),
                         item.get('product_id'),
-                        item_name
+                        item.get('name')
                     )
                     
-                    logger.info(f"      - Item ID: {item_id}")
-                    logger.info(f"      - SKU: {sku_used}")
+                    logger.info(f"Processing item: {item.get('name')} with SKU: {sku_used}")
                     
                     # Calculate item cost including tax proportion
-                    quantity = item.get('quantity', 0)
-                    unit_price = item.get('unit_price', 0)
-                    item_subtotal = quantity * unit_price
-                    
+                    item_subtotal = item.get('quantity', 0) * item.get('unit_price', 0)
                     tax_proportion = 0
+                    
                     if data.get('taxes') and data.get('subtotal'):
                         tax_rate = data.get('taxes') / data.get('subtotal')
                         tax_proportion = item_subtotal * tax_rate
                         
                     item_total_cost = item_subtotal + tax_proportion
-                    unit_cost_with_tax = item_total_cost / max(1, quantity)
-                    
-                    logger.info(f"      - Quantity: {quantity}")
-                    logger.info(f"      - Unit price: ${unit_price:.2f}")
-                    logger.info(f"      - Unit cost (w/tax): ${unit_cost_with_tax:.2f}")
+                    unit_cost_with_tax = item_total_cost / max(1, item.get('quantity', 1))
                     
                     # Add to adjustment
                     adjustment_items.append({
                         'item_id': item_id,
-                        'quantity_adjusted': quantity,
+                        'quantity_adjusted': item.get('quantity', 0),
                         'new_rate': unit_cost_with_tax,  # Cost per unit including tax
-                        'notes': f"Purchase from {vendor}"
+                        'notes': f"Purchase from {data.get('vendor_name', 'Unknown')}"
                     })
                     
                     total_cost += item_total_cost
                     
                     result['items_processed'].append({
-                        'name': item_name,
+                        'name': item.get('name'),
                         'sku': sku_used,
-                        'quantity': quantity,
+                        'quantity': item.get('quantity'),
                         'unit_cost': unit_cost_with_tax
                     })
                     
-                    logger.info(f"      ✅ Item processed successfully")
-                    
                 except Exception as e:
-                    logger.error(f"      ❌ Failed to process item {item_name}: {e}")
+                    logger.error(f"Failed to process item {item.get('name')}: {e}")
                     result['items_failed'].append({
-                        'name': item_name,
+                        'name': item.get('name'),
                         'error': str(e)
                     })
-                    result['warnings'].append(f"Item {item_name} failed: {e}")
+                    result['warnings'].append(f"Item {item.get('name')} failed: {e}")
                     
             # Create stock adjustment if we have items
             if adjustment_items:
-                logger.info(f"📈 Creating stock adjustment with {len(adjustment_items)} items...")
-                
                 try:
                     adjustment_data = {
                         'date': data.get('date', datetime.now().strftime('%Y-%m-%d')),
                         'reason': 'Stock Received',
-                        'description': f"Purchase Order: {order_number} from {vendor}",
+                        'description': f"Purchase Order: {data.get('order_number', 'N/A')} from {data.get('vendor_name', 'Unknown')}",
                         'adjustment_type': 'quantity',
                         'line_items': adjustment_items,
-                        'reference_number': order_number,
+                        'reference_number': data.get('order_number'),
                         'notes': self._build_adjustment_notes(data)
                     }
-                    
-                    logger.info(f"   - Date: {adjustment_data['date']}")
-                    logger.info(f"   - Reference: {adjustment_data['reference_number']}")
                     
                     # Create the adjustment
                     adjustment_response = self._make_api_request(
@@ -413,21 +268,18 @@ class ZohoClient:
                     result['stock_adjusted'] = True
                     result['success'] = True
                     
-                    logger.info(f"✅ Stock adjustment created successfully:")
-                    logger.info(f"   - Adjustment ID: {result['adjustment_id']}")
-                    logger.info(f"   - Total cost: ${total_cost:.2f}")
+                    logger.info(f"Created stock adjustment for purchase: {result['adjustment_id']}")
                     
                 except Exception as e:
                     result['errors'].append(f"Failed to create stock adjustment: {e}")
-                    logger.error(f"❌ Stock adjustment failed: {e}")
+                    logger.error(f"Stock adjustment failed: {e}")
                     
             else:
                 result['errors'].append("No items could be processed")
-                logger.error("❌ No items could be processed for stock adjustment")
                 
         except Exception as e:
             result['errors'].append(f"Purchase processing error: {e}")
-            logger.error(f"💥 Failed to process purchase stock: {e}", exc_info=True)
+            logger.error(f"Failed to process purchase stock: {e}")
             
         return result
         
@@ -441,12 +293,7 @@ class ZohoClient:
         Returns:
             Processing result dictionary
         """
-        order_number = data.get('order_number', 'N/A')
-        channel = data.get('channel', 'Unknown')
-        
-        logger.info(f"💰 Processing sale stock adjustment:")
-        logger.info(f"   - Order: {order_number}")
-        logger.info(f"   - Channel: {channel}")
+        logger.info(f"Processing sale stock adjustment for channel: {data.get('channel', 'Unknown')}")
         
         result = {
             'success': False,
@@ -466,20 +313,14 @@ class ZohoClient:
             total_revenue = 0
             total_cogs = 0
             
-            items = data.get('items', [])
-            logger.info(f"📋 Processing {len(items)} items...")
-            
-            for i, item in enumerate(items, 1):
-                item_name = item.get('name', f'Item {i}')
-                logger.info(f"   [{i}/{len(items)}] Processing: {item_name}")
-                
+            for item in data.get('items', []):
                 try:
                     # Get or create item with SKU
                     item_id, sku_used = self._get_or_create_item_with_sku(
                         item.get('sku'),
                         item.get('upc'),
                         item.get('product_id'),
-                        item_name
+                        item.get('name')
                     )
                     
                     # Get current stock and cost
@@ -487,78 +328,58 @@ class ZohoClient:
                     current_stock = item_details.get('stock_on_hand', 0)
                     current_cost = item_details.get('purchase_rate', 0)
                     
-                    quantity = item.get('quantity', 0)
-                    sale_price = item.get('sale_price', 0)
-                    
-                    logger.info(f"      - Item ID: {item_id}")
-                    logger.info(f"      - SKU: {sku_used}")
-                    logger.info(f"      - Current stock: {current_stock}")
-                    logger.info(f"      - Current cost: ${current_cost:.2f}")
-                    logger.info(f"      - Sale quantity: {quantity}")
-                    logger.info(f"      - Sale price: ${sale_price:.2f}")
+                    logger.info(f"Processing sale item: {item.get('name')} (stock: {current_stock})")
                     
                     # Check if we have sufficient stock
-                    if current_stock < quantity:
-                        warning_msg = (
-                            f"Insufficient stock for {item_name}: "
-                            f"have {current_stock}, need {quantity}"
+                    if current_stock < item.get('quantity', 0):
+                        result['warnings'].append(
+                            f"Insufficient stock for {item.get('name')}: "
+                            f"have {current_stock}, need {item.get('quantity')}"
                         )
-                        result['warnings'].append(warning_msg)
-                        logger.warning(f"      ⚠️ {warning_msg}")
                         
                     # Add to adjustment (negative for sales)
                     adjustment_items.append({
                         'item_id': item_id,
-                        'quantity_adjusted': -quantity,  # Negative for reduction
-                        'notes': f"Sale on {channel}"
+                        'quantity_adjusted': -item.get('quantity', 0),  # Negative for reduction
+                        'notes': f"Sale on {data.get('channel', 'Unknown')}"
                     })
                     
                     # Calculate revenue and COGS
-                    item_revenue = quantity * sale_price
-                    item_cogs = quantity * current_cost
+                    item_revenue = item.get('quantity', 0) * item.get('sale_price', 0)
+                    item_cogs = item.get('quantity', 0) * current_cost
                     
                     total_revenue += item_revenue
                     total_cogs += item_cogs
                     
                     result['items_processed'].append({
-                        'name': item_name,
+                        'name': item.get('name'),
                         'sku': sku_used,
-                        'quantity': quantity,
-                        'sale_price': sale_price,
+                        'quantity': item.get('quantity'),
+                        'sale_price': item.get('sale_price'),
                         'cost': current_cost,
                         'profit': item_revenue - item_cogs
                     })
                     
-                    logger.info(f"      - Revenue: ${item_revenue:.2f}")
-                    logger.info(f"      - COGS: ${item_cogs:.2f}")
-                    logger.info(f"      - Profit: ${item_revenue - item_cogs:.2f}")
-                    logger.info(f"      ✅ Item processed successfully")
-                    
                 except Exception as e:
-                    logger.error(f"      ❌ Failed to process item {item_name}: {e}")
+                    logger.error(f"Failed to process item {item.get('name')}: {e}")
                     result['items_failed'].append({
-                        'name': item_name,
+                        'name': item.get('name'),
                         'error': str(e)
                     })
-                    result['warnings'].append(f"Item {item_name} failed: {e}")
+                    result['warnings'].append(f"Item {item.get('name')} failed: {e}")
                     
             # Create stock adjustment if we have items
             if adjustment_items:
-                logger.info(f"📉 Creating stock adjustment with {len(adjustment_items)} items...")
-                
                 try:
                     adjustment_data = {
                         'date': data.get('date', datetime.now().strftime('%Y-%m-%d')),
                         'reason': 'Goods Sold',
-                        'description': f"Sale Order: {order_number} on {channel}",
+                        'description': f"Sale Order: {data.get('order_number', 'N/A')} on {data.get('channel', 'Unknown')}",
                         'adjustment_type': 'quantity',
                         'line_items': adjustment_items,
-                        'reference_number': order_number,
+                        'reference_number': data.get('order_number'),
                         'notes': self._build_adjustment_notes(data)
                     }
-                    
-                    logger.info(f"   - Date: {adjustment_data['date']}")
-                    logger.info(f"   - Reference: {adjustment_data['reference_number']}")
                     
                     # Create the adjustment
                     adjustment_response = self._make_api_request(
@@ -573,23 +394,18 @@ class ZohoClient:
                     result['revenue'] = total_revenue
                     result['cogs'] = total_cogs
                     
-                    logger.info(f"✅ Stock adjustment created successfully:")
-                    logger.info(f"   - Adjustment ID: {result['adjustment_id']}")
-                    logger.info(f"   - Total revenue: ${total_revenue:.2f}")
-                    logger.info(f"   - Total COGS: ${total_cogs:.2f}")
-                    logger.info(f"   - Total profit: ${total_revenue - total_cogs:.2f}")
+                    logger.info(f"Created stock adjustment for sale: {result['adjustment_id']}")
                     
                 except Exception as e:
                     result['errors'].append(f"Failed to create stock adjustment: {e}")
-                    logger.error(f"❌ Stock adjustment failed: {e}")
+                    logger.error(f"Stock adjustment failed: {e}")
                     
             else:
                 result['errors'].append("No items could be processed")
-                logger.error("❌ No items could be processed for stock adjustment")
                 
         except Exception as e:
             result['errors'].append(f"Sale processing error: {e}")
-            logger.error(f"💥 Failed to process sale stock: {e}", exc_info=True)
+            logger.error(f"Failed to process sale stock: {e}")
             
         return result
         
@@ -606,43 +422,32 @@ class ZohoClient:
         Returns:
             Tuple of (item_id, sku_used)
         """
-        logger.info(f"🔍 Looking up/creating item: {name}")
-        
         # Try existing identifiers first
         if sku:
-            logger.info(f"   - Checking existing SKU: {sku}")
             item_id = self._find_item_by_sku(sku)
             if item_id:
-                logger.info(f"   ✅ Found existing item by SKU: {item_id}")
                 return item_id, sku
                 
         if upc:
-            logger.info(f"   - Checking existing UPC: {upc}")
             item_id = self._find_item_by_upc(upc)
             if item_id:
-                logger.info(f"   ✅ Found existing item by UPC: {item_id}")
                 return item_id, upc
                 
         if product_id:
-            logger.info(f"   - Checking existing Product ID: {product_id}")
             item_id = self._find_item_by_field('product_id', product_id)
             if item_id:
-                logger.info(f"   ✅ Found existing item by Product ID: {item_id}")
                 return item_id, product_id
                 
         # Try to find by name
         with self._cache_lock:
             if name in self._cache['skus_by_name']:
                 cached_sku = self._cache['skus_by_name'][name]
-                logger.info(f"   - Checking cached SKU by name: {cached_sku}")
                 item_id = self._find_item_by_sku(cached_sku)
                 if item_id:
-                    logger.info(f"   ✅ Found existing item by cached name: {item_id}")
                     return item_id, cached_sku
                     
         # Search for existing item by name
         try:
-            logger.info(f"   - Searching Zoho for existing item by name...")
             params = {'name': name}
             response = self._make_api_request('GET', 'items', params=params)
             
@@ -654,8 +459,6 @@ class ZohoClient:
                         item_id = item['item_id']
                         item_sku = item.get('sku', '')
                         
-                        logger.info(f"   ✅ Found existing item by name search: {item_id}")
-                        
                         # Cache the mapping
                         with self._cache_lock:
                             self._cache['skus_by_name'][name] = item_sku
@@ -664,7 +467,7 @@ class ZohoClient:
                         return item_id, item_sku
                         
         except Exception as e:
-            logger.debug(f"   ⚠️ Error searching for item by name: {e}")
+            logger.debug(f"Error searching for item by name: {e}")
             
         # Generate SKU if needed
         if self.auto_generate_sku:
@@ -672,8 +475,6 @@ class ZohoClient:
         else:
             generated_sku = sku or upc or product_id or f"TEMP-{datetime.now().strftime('%Y%m%d%H%M%S')}"
             
-        logger.info(f"   🆕 Creating new item with SKU: {generated_sku}")
-        
         # Create new item
         item_data = {
             'name': name,
@@ -702,11 +503,11 @@ class ZohoClient:
                 self._cache['items'][generated_sku] = item_id
                 self._cache['skus_by_name'][name] = generated_sku
                 
-            logger.info(f"   ✅ Created new item successfully: {item_id}")
+            logger.info(f"Created new item: {name} with SKU: {generated_sku}")
             return item_id, generated_sku
             
         except Exception as e:
-            logger.error(f"   ❌ Failed to create item {name}: {e}")
+            logger.error(f"Failed to create item {name}: {e}")
             raise
             
     def _generate_sku(self, name: str, sku: str = None, upc: str = None, product_id: str = None) -> str:
@@ -828,16 +629,87 @@ class ZohoClient:
         elif data.get('channel'):
             notes.append(f"Channel: {data.get('channel')}")
             
-        if data.get('email_seq_num'):
-            notes.append(f"Email Seq: {data.get('email_seq_num')}")
+        if data.get('email_uid'):
+            notes.append(f"Email UID: {data.get('email_uid')}")
             
         if data.get('confidence_score'):
             notes.append(f"Confidence: {data.get('confidence_score', 0):.2f}")
             
-        return ' | '.join(notes)
+        return ' | '.join(notes) if notes else ""
         
     def get_inventory_summary(self) -> Dict:
         """Get summary of current inventory levels."""
-        logger.info("📊 Generating inventory summary...")
-        
         try:
+            response = self._make_api_request('GET', 'items')
+            
+            summary = {
+                'total_items': 0,
+                'total_stock_value': 0,
+                'low_stock_items': [],
+                'out_of_stock_items': []
+            }
+            
+            for item in response.get('items', []):
+                if item.get('item_type') == 'inventory':
+                    summary['total_items'] += 1
+                    
+                    stock = item.get('stock_on_hand', 0)
+                    rate = item.get('purchase_rate', 0)
+                    reorder_level = item.get('reorder_level', 0)
+                    
+                    summary['total_stock_value'] += stock * rate
+                    
+                    if stock == 0:
+                        summary['out_of_stock_items'].append({
+                            'name': item.get('name'),
+                            'sku': item.get('sku')
+                        })
+                    elif stock <= reorder_level:
+                        summary['low_stock_items'].append({
+                            'name': item.get('name'),
+                            'sku': item.get('sku'),
+                            'stock': stock,
+                            'reorder_level': reorder_level
+                        })
+                        
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Failed to get inventory summary: {e}")
+            return {}
+            
+    def verify_stock_levels(self, sku: str) -> Dict:
+        """Verify current stock levels for a specific SKU."""
+        try:
+            item_id = self._find_item_by_sku(sku)
+            if not item_id:
+                return {'error': f"SKU {sku} not found"}
+                
+            item = self._get_item_details(item_id)
+            
+            return {
+                'sku': item.get('sku'),
+                'name': item.get('name'),
+                'stock_on_hand': item.get('stock_on_hand', 0),
+                'available_stock': item.get('available_stock', 0),
+                'purchase_rate': item.get('purchase_rate', 0),
+                'selling_price': item.get('selling_price', 0),
+                'reorder_level': item.get('reorder_level', 0),
+                'stock_value': item.get('stock_on_hand', 0) * item.get('purchase_rate', 0)
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to verify stock for {sku}: {e}")
+            return {'error': str(e)}
+            
+    def clear_cache(self):
+        """Clear the entity cache."""
+        with self._cache_lock:
+            self._cache = {
+                'items': {},
+                'vendors': {},
+                'customers': {},
+                'taxes': self._cache.get('taxes', {}),  # Keep tax config
+                'skus_by_name': {}
+            }
+        logger.info("Cleared entity cache")
