@@ -115,7 +115,7 @@ class EmailParser:
     def __init__(self, config):
         self.config = config
         self.client = OpenAI(api_key=config.get('OPENAI_API_KEY'))
-        self.model = config.get('OPENAI_MODEL', 'gpt-4')
+        self.model = config.get('OPENAI_MODEL', 'gpt-4o-mini')  # Default to gpt-4o-mini
         self.temperature = config.get_float('OPENAI_TEMPERATURE', 0.1)
         self.max_retries = config.get_int('OPENAI_MAX_RETRIES', 3)
         self.retry_delay = config.get_int('OPENAI_RETRY_DELAY', 2)
@@ -219,6 +219,7 @@ class EmailParser:
         try:
             prompt = self._create_enhanced_prompt(body, subject)
             
+            # Removed response_format parameter as it's not supported by all models
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
@@ -226,7 +227,6 @@ class EmailParser:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=self.temperature,
-                response_format={"type": "json_object"},
                 max_tokens=2000
             )
             
@@ -239,26 +239,55 @@ class EmailParser:
     def _parse_response(self, response: str) -> Optional[Dict]:
         """Parse and clean the OpenAI response."""
         try:
+            # First, try to extract JSON from the response
+            json_text = self._extract_json_from_text(response)
+            
+            if not json_text:
+                logger.error("No JSON found in OpenAI response")
+                return None
+            
             # Try to parse as JSON
-            data = json.loads(response)
+            data = json.loads(json_text)
             
             # Clean up the data
             return self._clean_parsed_data(data)
             
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON from OpenAI: {e}")
-            
-            # Try to extract JSON from the response
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                try:
-                    data = json.loads(json_match.group())
-                    return self._clean_parsed_data(data)
-                except:
-                    pass
-                    
+            logger.debug(f"Raw response: {response}")
             return None
             
+    def _extract_json_from_text(self, text: str) -> Optional[str]:
+        """Extract JSON object from text response."""
+        # Try to find JSON block markers first
+        json_patterns = [
+            r'```json\s*(\{.*?\})\s*```',  # ```json { ... } ```
+            r'```\s*(\{.*?\})\s*```',     # ``` { ... } ```
+            r'(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})',  # Direct JSON object
+        ]
+        
+        for pattern in json_patterns:
+            matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
+            if matches:
+                # Return the first match
+                return matches[0].strip()
+        
+        # If no clear JSON block found, try to extract the largest JSON-like structure
+        # Look for anything that starts with { and ends with }
+        start_idx = text.find('{')
+        if start_idx != -1:
+            # Find the matching closing brace
+            brace_count = 0
+            for i, char in enumerate(text[start_idx:], start_idx):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        return text[start_idx:i+1]
+        
+        return None
+        
     def _clean_parsed_data(self, data: Dict) -> Dict:
         """Clean and normalize parsed data."""
         cleaned = {}
@@ -597,8 +626,10 @@ CRITICAL INSTRUCTIONS:
 2. Extract EXACTLY what is in the email. Do not interpolate missing values.
 3. Tax must be captured separately from item prices.
 4. Mark any item missing name, quantity, or unit price as incomplete.
+5. ALWAYS respond with valid JSON wrapped in ```json ``` blocks.
 
 For PURCHASE emails return:
+```json
 {
     "type": "purchase",
     "date": "YYYY-MM-DD" or null,
@@ -620,8 +651,10 @@ For PURCHASE emails return:
     "shipping": number or null,
     "total": number or null
 }
+```
 
 For SALES emails return:
+```json
 {
     "type": "sale",
     "date": "YYYY-MM-DD" or null,
@@ -645,19 +678,23 @@ For SALES emails return:
     "shipping": number or null,
     "total": number or null
 }
+```
 
 If the email is neither clearly a purchase nor sale:
+```json
 {
     "type": "unknown",
     "reason": "brief explanation",
     "partial_data": {any fields you could extract}
 }
+```
 
 IMPORTANT: 
 - Set any missing field to null
 - Tax MUST be a separate field from item prices
 - Do NOT include tax in unit_price or sale_price
-- Extract all available product identifiers (SKU, UPC, product ID)"""
+- Extract all available product identifiers (SKU, UPC, product ID)
+- ALWAYS wrap your JSON response in ```json ``` blocks"""
         
     def _create_enhanced_prompt(self, body: str, subject: str) -> str:
         """Create enhanced prompt with completeness focus."""
@@ -668,6 +705,7 @@ REMEMBER:
 - Tax must be captured as a SEPARATE field
 - Set missing fields to null - do not guess
 - Unit prices should EXCLUDE tax
+- Always wrap JSON in ```json ``` blocks
 
 Email Subject: {subject}
 

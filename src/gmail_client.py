@@ -29,6 +29,9 @@ class GmailClient:
         self.html_converter.ignore_links = False
         self.html_converter.ignore_images = True
         self.processed_label_name = config.get('GMAIL_PROCESSED_LABEL', 'PROCESSED')
+        
+        # Cache capabilities
+        self._capabilities = None
 
         self.connect()
 
@@ -63,6 +66,10 @@ class GmailClient:
                     status, data = self.imap.select('INBOX')
                     if status != 'OK':
                         raise Exception(f"Failed to select INBOX: {data}")
+                    
+                    # Cache capabilities for this session
+                    self._load_capabilities()
+                    
                     self.processed_seq_nums.clear()
                     self.last_reconnect = datetime.now()
                     logger.info("Connected to Gmail successfully")
@@ -79,6 +86,36 @@ class GmailClient:
                     time.sleep(retry_delay)
                 else:
                     raise
+        return False
+
+    def _load_capabilities(self):
+        """Load and cache server capabilities."""
+        try:
+            if self.imap:
+                status, capabilities = self.imap.capability()
+                if status == 'OK' and capabilities:
+                    self._capabilities = capabilities[0].decode().upper().split()
+                    logger.debug(f"IMAP capabilities: {self._capabilities}")
+                else:
+                    self._capabilities = []
+        except Exception as e:
+            logger.warning(f"Could not load IMAP capabilities: {e}")
+            self._capabilities = []
+
+    def _check_capability(self, capability: str) -> bool:
+        """Check if server supports a specific capability."""
+        if self._capabilities is None:
+            self._load_capabilities()
+        
+        if self._capabilities:
+            return capability.upper() in self._capabilities
+        
+        # Fallback: try to detect based on server type
+        if capability.upper() == 'X-GM-EXT-1':
+            # Gmail extension - assume true for Gmail servers
+            server = self.config.get('GMAIL_IMAP_SERVER', 'imap.gmail.com')
+            return 'gmail.com' in server.lower()
+        
         return False
 
     def ensure_connection(self) -> bool:
@@ -314,19 +351,29 @@ class GmailClient:
             status, data = self.imap.store(seq_num, '+FLAGS', '\\Seen')
             if status != 'OK':
                 success = False
+            
+            # Try to add Gmail label if supported
             if self._check_capability('X-GM-EXT-1'):
                 try:
                     status, data = self.imap.store(seq_num, '+X-GM-LABELS', f'({self.processed_label_name})')
                     if status != 'OK':
-                        success = False
-                except:
+                        logger.debug(f"Could not add Gmail label: {data}")
+                        # Don't mark as failure - label is optional
+                except Exception as e:
+                    logger.debug(f"Gmail label operation failed: {e}")
+                    # Fall back to using flag instead
                     use_flag = True
+            
+            # Use flag as backup method
             if use_flag:
                 status, data = self.imap.store(seq_num, '+FLAGS', '\\Flagged')
                 if status != 'OK':
-                    success = False
+                    logger.warning(f"Could not flag email: {data}")
+                    # Still don't mark as complete failure
+                    
             self.processed_seq_nums.add(seq_num)
             return success
+            
         except Exception as e:
             logger.error(f"Error marking email as processed: {str(e)}")
             return False
