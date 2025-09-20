@@ -1,4 +1,4 @@
-"""Gmail client for fetching and processing emails with robust error handling."""
+"""Gmail client using consistent IMAP sequence numbers for stability."""
 
 import imaplib
 import email
@@ -16,17 +16,16 @@ logger = logging.getLogger(__name__)
 
 
 class GmailClient:
-    """Handle Gmail IMAP operations with robust error handling and resource management."""
+    """Handle Gmail IMAP operations using sequence numbers consistently."""
     
     def __init__(self, config):
         self.config = config
         self.imap = None
-        self.processed_uids: Set[str] = set()
+        self.processed_seq_nums: Set[str] = set()  # Track by sequence number
         self.connection_lock = Lock()
         self.last_reconnect = None
         self.reconnect_delay = 5  # seconds
         self.max_fetch_batch = config.get_int('EMAIL_BATCH_SIZE', 10)
-        self.use_uid = True  # Always use UID for stability
         self.html_converter = html2text.HTML2Text()
         self.html_converter.ignore_links = False
         self.html_converter.ignore_images = True
@@ -84,12 +83,13 @@ class GmailClient:
                     if status != 'OK':
                         raise Exception(f"Failed to select INBOX: {data}")
                     
+                    # Clear processed sequence numbers on new connection
+                    # (sequence numbers are only valid within a session)
+                    self.processed_seq_nums.clear()
+                    
                     # Enable Gmail extensions if available
                     if self._check_capability('X-GM-EXT-1'):
                         logger.debug("Gmail extensions enabled")
-                    
-                    # Ensure processed label exists
-                    self._ensure_processed_label()
                     
                     self.last_reconnect = datetime.now()
                     logger.info("Connected to Gmail successfully")
@@ -118,24 +118,6 @@ class GmailClient:
         except:
             return False
             
-    def _ensure_processed_label(self):
-        """Ensure the processed label exists in Gmail."""
-        try:
-            # Check if Gmail extensions are available
-            if not self._check_capability('X-GM-EXT-1'):
-                logger.warning("Gmail extensions not available, using standard IMAP flags only")
-                return
-                
-            # Try to create the label (will fail silently if it exists)
-            # Gmail doesn't support creating labels via IMAP directly,
-            # but we can verify if we can use labels
-            status, data = self.imap.list('', self.processed_label_name)
-            if status != 'OK':
-                logger.info(f"Note: Custom Gmail label '{self.processed_label_name}' may not exist. Will use standard flags.")
-                
-        except Exception as e:
-            logger.debug(f"Could not verify processed label: {e}")
-            
     def ensure_connection(self) -> bool:
         """Ensure IMAP connection is active, reconnect if needed."""
         try:
@@ -156,7 +138,7 @@ class GmailClient:
         
     def fetch_unread_emails(self, max_emails: Optional[int] = None) -> List[Dict]:
         """
-        Fetch unread emails using UID for stability.
+        Fetch unread emails using sequence numbers.
         
         Args:
             max_emails: Maximum number of emails to fetch (None for config default)
@@ -173,54 +155,58 @@ class GmailClient:
         max_emails = max_emails or self.max_fetch_batch
         
         try:
-            # Search using UID for stability
+            # Search using standard IMAP (returns sequence numbers)
             # First try with Gmail extensions if available
-            search_criteria = 'UNSEEN'
-
+            if self._check_capability('X-GM-EXT-1'):
+                search_criteria = f'(UNSEEN -X-GM-LABELS "{self.processed_label_name}")'
+            else:
+                # Fallback to standard IMAP
+                search_criteria = '(UNSEEN UNFLAGGED)'
                 
             logger.debug(f"Searching with criteria: {search_criteria}")
             
-            # Use UID SEARCH for stable references
-            status, data = self.imap.uid('search', None, search_criteria)
+            # Use standard search (returns sequence numbers)
+            status, data = self.imap.search(None, search_criteria)
             
             if status != 'OK':
                 logger.error(f"Search failed: {data}")
                 return emails
                 
-            uid_list = data[0].split()
+            # Get sequence numbers
+            seq_num_list = data[0].split()
             
-            if not uid_list:
+            if not seq_num_list:
                 logger.debug("No unread emails found")
                 return emails
                 
             # Limit number of emails to process
-            uid_list = uid_list[:max_emails]
-            logger.info(f"Found {len(uid_list)} unread emails to process")
+            seq_num_list = seq_num_list[:max_emails]
+            logger.info(f"Found {len(seq_num_list)} unread emails to process")
             
-            # Fetch emails by UID in batches
+            # Fetch emails by sequence number in batches
             batch_size = 5  # Fetch 5 at a time to avoid timeouts
             
-            for i in range(0, len(uid_list), batch_size):
-                batch = uid_list[i:i + batch_size]
+            for i in range(0, len(seq_num_list), batch_size):
+                batch = seq_num_list[i:i + batch_size]
                 
-                for uid in batch:
+                for seq_num in batch:
                     # Skip if already processed in this session
-                    uid_str = uid.decode()
-                    if uid_str in self.processed_uids:
-                        logger.debug(f"Skipping already processed UID: {uid_str}")
+                    seq_num_str = seq_num.decode() if isinstance(seq_num, bytes) else str(seq_num)
+                    if seq_num_str in self.processed_seq_nums:
+                        logger.debug(f"Skipping already processed sequence number: {seq_num_str}")
                         continue
                         
                     try:
-                        email_dict = self._fetch_single_email(uid)
+                        email_dict = self._fetch_single_email(seq_num)
                         if email_dict:
                             emails.append(email_dict)
                             
                     except Exception as e:
-                        logger.error(f"Error fetching email UID {uid}: {str(e)}")
+                        logger.error(f"Error fetching email sequence {seq_num}: {str(e)}")
                         continue
                         
                 # Small delay between batches to avoid rate limiting
-                if i + batch_size < len(uid_list):
+                if i + batch_size < len(seq_num_list):
                     time.sleep(0.5)
                     
         except imaplib.IMAP4.abort:
@@ -233,22 +219,28 @@ class GmailClient:
             
         return emails
         
-    def _fetch_single_email(self, uid: bytes) -> Optional[Dict]:
+    def _fetch_single_email(self, seq_num: bytes) -> Optional[Dict]:
         """
-        Fetch and parse a single email by UID.
+        Fetch and parse a single email by sequence number.
         
         Args:
-            uid: Email UID
+            seq_num: Email sequence number (as bytes)
             
         Returns:
             Parsed email dictionary or None if failed
         """
         try:
-            # Fetch email by UID
-            status, msg_data = self.imap.uid('fetch', uid, '(RFC822 FLAGS INTERNALDATE)')
+            # Convert sequence number to string for consistent handling
+            if isinstance(seq_num, bytes):
+                seq_num_str = seq_num.decode()
+            else:
+                seq_num_str = str(seq_num)
+            
+            # Fetch email by sequence number (not UID)
+            status, msg_data = self.imap.fetch(seq_num_str, '(RFC822 FLAGS INTERNALDATE)')
             
             if status != 'OK' or not msg_data or not msg_data[0]:
-                logger.error(f"Failed to fetch email UID {uid}")
+                logger.error(f"Failed to fetch email sequence {seq_num_str}")
                 return None
                 
             # Parse response
@@ -257,12 +249,12 @@ class GmailClient:
             
             # Parse email with enhanced encoding detection
             email_dict = self._parse_email_enhanced(message)
-            email_dict['uid'] = uid.decode()
+            email_dict['seq_num'] = seq_num_str  # Store sequence number, not UID
             
             # Add IMAP metadata if available
             if len(msg_data[0]) > 2:
                 try:
-                    metadata = msg_data[0][0].decode()
+                    metadata = msg_data[0][0].decode() if msg_data[0][0] else ""
                     if 'INTERNALDATE' in metadata:
                         # Extract internal date if available
                         import re
@@ -275,7 +267,7 @@ class GmailClient:
             return email_dict
             
         except Exception as e:
-            logger.error(f"Error parsing email {uid}: {str(e)}")
+            logger.error(f"Error parsing email sequence {seq_num}: {str(e)}")
             return None
             
     def _parse_email_enhanced(self, message) -> Dict:
@@ -461,12 +453,12 @@ class GmailClient:
         html_content = re.sub(r'\s+', ' ', html_content)
         return html_content.strip()
         
-    def mark_as_processed(self, uid: str, use_flag: bool = True) -> bool:
+    def mark_as_processed(self, seq_num: str, use_flag: bool = True) -> bool:
         """
-        Mark email as processed using UID.
+        Mark email as processed using sequence number.
         
         Args:
-            uid: Email UID
+            seq_num: Email sequence number as string
             use_flag: Whether to use FLAG in addition to label
             
         Returns:
@@ -478,36 +470,36 @@ class GmailClient:
         try:
             success = True
             
-            # Mark as read
-            status, data = self.imap.uid('store', uid, '+FLAGS', '\\Seen')
+            # Mark as read using sequence number
+            status, data = self.imap.store(seq_num, '+FLAGS', '\\Seen')
             if status != 'OK':
-                logger.warning(f"Failed to mark email {uid} as read: {data}")
+                logger.warning(f"Failed to mark email {seq_num} as read: {data}")
                 success = False
                 
             # Try to add Gmail label if available
             if self._check_capability('X-GM-EXT-1'):
                 try:
-                    status, data = self.imap.uid('store', uid, '+X-GM-LABELS', f'({self.processed_label_name})')
+                    status, data = self.imap.store(seq_num, '+X-GM-LABELS', f'({self.processed_label_name})')
                     if status != 'OK':
-                        logger.warning(f"Failed to add label to email {uid}: {data}")
+                        logger.warning(f"Failed to add label to email {seq_num}: {data}")
                 except:
                     # Label might not be supported, fall back to flag
                     use_flag = True
                     
             # Use FLAG as fallback or additional marker
             if use_flag:
-                status, data = self.imap.uid('store', uid, '+FLAGS', '\\Flagged')
+                status, data = self.imap.store(seq_num, '+FLAGS', '\\Flagged')
                 if status != 'OK':
-                    logger.warning(f"Failed to flag email {uid}: {data}")
+                    logger.warning(f"Failed to flag email {seq_num}: {data}")
                     success = False
                     
             # Track in session
-            self.processed_uids.add(uid)
+            self.processed_seq_nums.add(seq_num)
             
             if success:
-                logger.debug(f"Marked email {uid} as processed")
+                logger.debug(f"Marked email sequence {seq_num} as processed")
             else:
-                logger.warning(f"Partial success marking email {uid} as processed")
+                logger.warning(f"Partial success marking email sequence {seq_num} as processed")
                 
             return success
             
@@ -517,23 +509,24 @@ class GmailClient:
             
     def search_by_criteria(self, criteria: str, max_results: int = 10) -> List[str]:
         """
-        Search emails by custom criteria.
+        Search emails by custom criteria using sequence numbers.
         
         Args:
             criteria: IMAP search criteria
             max_results: Maximum results to return
             
         Returns:
-            List of UIDs matching criteria
+            List of sequence numbers as strings
         """
         if not self.ensure_connection():
             return []
             
         try:
-            status, data = self.imap.uid('search', None, criteria)
+            # Use standard search (returns sequence numbers)
+            status, data = self.imap.search(None, criteria)
             if status == 'OK':
-                uids = data[0].split()[:max_results]
-                return [uid.decode() for uid in uids]
+                seq_nums = data[0].split()[:max_results]
+                return [seq.decode() if isinstance(seq, bytes) else str(seq) for seq in seq_nums]
         except Exception as e:
             logger.error(f"Search failed: {e}")
             
