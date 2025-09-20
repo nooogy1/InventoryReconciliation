@@ -109,8 +109,8 @@ class InventoryReconciliationApp:
                 self.stats['errors'] += 1
                 return
                 
-            # Add email metadata
-            parsed_data['email_uid'] = email_data['uid']
+            # Add email metadata (using sequence number instead of UID)
+            parsed_data['email_seq_num'] = email_data.get('seq_num')
             parsed_data['email_date'] = email_data['date']
             parsed_data['parse_result'] = parse_result.to_dict()
             
@@ -551,10 +551,11 @@ class InventoryReconciliationApp:
             logger.info(f"Found {len(new_emails)} new emails")
             
             for email in new_emails:
-                if email['uid'] not in self.processed_uids:
+                seq_num = email.get('seq_num')
+                if seq_num and seq_num not in self.processed_seq_nums:
                     self.process_email(email)
-                    self.processed_uids.add(email['uid'])
-                    self.gmail.mark_as_processed(email['uid'])
+                    self.processed_seq_nums.add(seq_num)
+                    self.gmail.mark_as_processed(seq_num)
                     
         except Exception as e:
             error_msg = f"Error in run cycle: {str(e)}"
