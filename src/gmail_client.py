@@ -1,4 +1,4 @@
-"""Gmail client using consistent IMAP sequence numbers for stability."""
+"""Gmail client using consistent IMAP sequence numbers for stability - FIXED VERSION."""
 
 import imaplib
 import email
@@ -171,20 +171,22 @@ class GmailClient:
                 batch = seq_num_list[i:i + batch_size]
 
                 for seq_num in batch:
-                    # Handle both bytes and int sequence numbers safely
+                    # FIX: Handle both bytes and different types of sequence numbers safely
                     if isinstance(seq_num, bytes):
                         seq_num_str = seq_num.decode()
+                    elif isinstance(seq_num, int):
+                        seq_num_str = str(seq_num)
                     else:
                         seq_num_str = str(seq_num)
                         
                     if seq_num_str in self.processed_seq_nums:
                         continue
                     try:
-                        email_dict = self._fetch_single_email(seq_num)
+                        email_dict = self._fetch_single_email(seq_num_str)
                         if email_dict:
                             emails.append(email_dict)
                     except Exception as e:
-                        logger.error(f"Error fetching email sequence {seq_num}: {str(e)}")
+                        logger.error(f"Error fetching email sequence {seq_num_str}: {str(e)}")
                         continue
                 if i + batch_size < len(seq_num_list):
                     time.sleep(0.5)
@@ -218,25 +220,31 @@ class GmailClient:
         else:
             return f'({" ".join(criteria_parts)})'
 
-    def _fetch_single_email(self, seq_num) -> Optional[Dict]:
+    def _fetch_single_email(self, seq_num_str: str) -> Optional[Dict]:
+        """
+        FIXED: Fetch single email with proper type handling.
+        
+        Args:
+            seq_num_str: Sequence number as string
+            
+        Returns:
+            Email dictionary or None
+        """
         try:
-            # Handle both bytes and int sequence numbers safely
-            if isinstance(seq_num, bytes):
-                seq_num_str = seq_num.decode()
-            else:
-                seq_num_str = str(seq_num)
-                
+            # seq_num_str is already a string at this point
             status, msg_data = self.imap.fetch(seq_num_str, '(RFC822 FLAGS INTERNALDATE)')
             if status != 'OK' or not msg_data or not msg_data[0]:
                 return None
+                
             email_body = msg_data[0][1]
             message = email.message_from_bytes(email_body)
             email_dict = self._parse_email_enhanced(message)
             email_dict['seq_num'] = seq_num_str
             self.processed_seq_nums.add(seq_num_str)
             return email_dict
+            
         except Exception as e:
-            logger.error(f"Error fetching single email {seq_num}: {str(e)}")
+            logger.error(f"Error fetching single email {seq_num_str}: {str(e)}")
             return None
 
     def _parse_email_enhanced(self, message) -> Dict:
