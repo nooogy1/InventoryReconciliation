@@ -171,7 +171,12 @@ class GmailClient:
                 batch = seq_num_list[i:i + batch_size]
 
                 for seq_num in batch:
-                    seq_num_str = seq_num.decode() if isinstance(seq_num, bytes) else str(seq_num)
+                    # Handle both bytes and int sequence numbers safely
+                    if isinstance(seq_num, bytes):
+                        seq_num_str = seq_num.decode()
+                    else:
+                        seq_num_str = str(seq_num)
+                        
                     if seq_num_str in self.processed_seq_nums:
                         continue
                     try:
@@ -215,7 +220,12 @@ class GmailClient:
 
     def _fetch_single_email(self, seq_num) -> Optional[Dict]:
         try:
-            seq_num_str = seq_num.decode() if isinstance(seq_num, bytes) else str(seq_num)
+            # Handle both bytes and int sequence numbers safely
+            if isinstance(seq_num, bytes):
+                seq_num_str = seq_num.decode()
+            else:
+                seq_num_str = str(seq_num)
+                
             status, msg_data = self.imap.fetch(seq_num_str, '(RFC822 FLAGS INTERNALDATE)')
             if status != 'OK' or not msg_data or not msg_data[0]:
                 return None
