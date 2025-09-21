@@ -240,7 +240,7 @@ class AirtableClient:
         """Find inventory item by SKU using EXACT field name."""
         try:
             params = {
-                'filterByFormula': f"{{SKU}} = '{sku}'"  # ✅ EXACT field name
+                'filterByFormula': f"{{SKU}} = '{sku}'"
             }
             
             response = requests.get(
@@ -255,8 +255,8 @@ class AirtableClient:
                 record = records[0]
                 return {
                     'record_id': record['id'],
-                    'sku': record['fields'].get('SKU', ''),              # ✅ EXACT field name
-                    'current_quantity': record['fields'].get('Quantity', 0),  # ✅ EXACT field name
+                    'sku': record['fields'].get('SKU', ''),
+                    'current_quantity': record['fields'].get('Quantity', 0),
                     'action': 'found'
                 }
                 
@@ -270,7 +270,7 @@ class AirtableClient:
         try:
             # Since UPC becomes the SKU, search by SKU field
             params = {
-                'filterByFormula': f"{{SKU}} = '{upc}'"  # ✅ EXACT field name
+                'filterByFormula': f"{{SKU}} = '{upc}'"
             }
             
             response = requests.get(
@@ -285,8 +285,8 @@ class AirtableClient:
                 record = records[0]
                 return {
                     'record_id': record['id'],
-                    'sku': record['fields'].get('SKU', ''),              # ✅ EXACT field name
-                    'current_quantity': record['fields'].get('Quantity', 0),  # ✅ EXACT field name
+                    'sku': record['fields'].get('SKU', ''),
+                    'current_quantity': record['fields'].get('Quantity', 0),
                     'action': 'found'
                 }
                 
@@ -301,7 +301,7 @@ class AirtableClient:
             # Escape single quotes in name for formula
             escaped_name = name.replace("'", "\\'")
             params = {
-                'filterByFormula': f"{{'Item Name'}} = '{escaped_name}'"  # ✅ EXACT field name with quotes
+                'filterByFormula': f"{{'Item Name'}} = '{escaped_name}'"
             }
             
             response = requests.get(
@@ -316,8 +316,8 @@ class AirtableClient:
                 record = records[0]
                 return {
                     'record_id': record['id'],
-                    'sku': record['fields'].get('SKU', ''),              # ✅ EXACT field name
-                    'current_quantity': record['fields'].get('Quantity', 0),  # ✅ EXACT field name
+                    'sku': record['fields'].get('SKU', ''),
+                    'current_quantity': record['fields'].get('Quantity', 0),
                     'action': 'found'
                 }
                 
@@ -335,13 +335,12 @@ class AirtableClient:
             # Create record with YOUR EXACT field names from InventoryStock table
             record_data = {
                 "fields": {
-                    "SKU": sku,                                    # ✅ Matches your field
-                    "Item Name": item.get('name', ''),             # ✅ Matches your field  
-                    "Quantity": 0,                                 # ✅ Matches your field
-                    "Created At": datetime.now().isoformat(),      # ✅ Matches your field
-                    "Last Updated": datetime.now().isoformat(),    # ✅ Matches your field
-                    "Summary": "Initial creation"                   # ✅ Matches your field
-                    # Note: Skipping "Attachment" as it's optional and complex
+                    "SKU": sku,
+                    "Item Name": item.get('name', ''),
+                    "Quantity": 0,
+                    "Created At": datetime.now().isoformat(),
+                    "Last Updated": datetime.now().isoformat(),
+                    "Summary": "Initial creation"
                 }
             }
             
@@ -426,9 +425,9 @@ class AirtableClient:
         try:
             update_data = {
                 "fields": {
-                    "Quantity": new_quantity,                           # ✅ EXACT field name
-                    "Last Updated": datetime.now().isoformat(),         # ✅ EXACT field name
-                    "Summary": f"{transaction_type.title()}: {order_number}"  # ✅ EXACT field name
+                    "Quantity": new_quantity,
+                    "Last Updated": datetime.now().isoformat(),
+                    "Summary": f"{transaction_type.title()}: {order_number}"
                 }
             }
             
@@ -473,7 +472,56 @@ class AirtableClient:
                 "Processed At": datetime.now().isoformat(),
                 "Processing Status": data.get('processing_status', 'airtable_complete'),
                 "Inventory Items Count": data.get('inventory_items_count', 0),
-                # Review fields
+                "Requires Review": data.get('requires_review', False),
+                "Confidence Score": data.get('confidence_score', 0),
+                "Missing Fields": ', '.join(parse_result.get('missing_fields', [])),
+                "Parse Status": parse_metadata.get('status', 'unknown'),
+                "Parse Warnings": json.dumps(parse_result.get('warnings', [])),
+                "Review Notes": self._generate_review_notes(data, parse_result)
+            }
+        }
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/{self.purchases_table}",
+                json={"records": [record]},
+                headers=self.headers
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            logger.info(f"✅ Created purchase record: {result['records'][0]['id']}")
+            
+            return result['records'][0]
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to create purchase record: {str(e)}")
+            raise
+            
+    def create_sale(self, data: Dict) -> Optional[Dict]:
+        """Create a sale record in Airtable."""
+        logger.info(f"💾 Creating sale record in Airtable...")
+        
+        # Extract parse metadata
+        parse_metadata = data.get('parse_metadata', {})
+        parse_result = data.get('parse_result', {})
+        
+        # Transform data for Airtable
+        record = {
+            "fields": {
+                "Order Number": data.get('order_number'),
+                "Date": data.get('date'),
+                "Channel": data.get('channel'),
+                "Customer Email": data.get('customer_email'),
+                "Items": json.dumps(data.get('items', [])),
+                "Subtotal": data.get('subtotal', 0),
+                "Taxes": data.get('taxes', 0),
+                "Fees": data.get('fees', 0),
+                "Total": data.get('total', 0),
+                "Email Seq Num": data.get('email_seq_num'),
+                "Processed At": datetime.now().isoformat(),
+                "Processing Status": data.get('processing_status', 'airtable_complete'),
+                "Inventory Items Count": data.get('inventory_items_count', 0),
                 "Requires Review": data.get('requires_review', False),
                 "Confidence Score": data.get('confidence_score', 0),
                 "Missing Fields": ', '.join(parse_result.get('missing_fields', [])),
@@ -638,55 +686,4 @@ class AirtableClient:
         if data.get('total_mismatch'):
             notes.append(f"Total mismatch: calculated ${data.get('total_calculated', 0):.2f} vs stated ${data.get('total', 0):.2f}")
             
-        return ' | '.join(notes) if notes else ""confidence_score', 0),
-                "Missing Fields": ', '.join(parse_result.get('missing_fields', [])),
-                "Parse Status": parse_metadata.get('status', 'unknown'),
-                "Parse Warnings": json.dumps(parse_result.get('warnings', [])),
-                "Review Notes": self._generate_review_notes(data, parse_result)
-            }
-        }
-        
-        try:
-            response = requests.post(
-                f"{self.base_url}/{self.purchases_table}",
-                json={"records": [record]},
-                headers=self.headers
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            logger.info(f"✅ Created purchase record: {result['records'][0]['id']}")
-            
-            return result['records'][0]
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to create purchase record: {str(e)}")
-            raise
-            
-    def create_sale(self, data: Dict) -> Optional[Dict]:
-        """Create a sale record in Airtable."""
-        logger.info(f"💾 Creating sale record in Airtable...")
-        
-        # Extract parse metadata
-        parse_metadata = data.get('parse_metadata', {})
-        parse_result = data.get('parse_result', {})
-        
-        # Transform data for Airtable
-        record = {
-            "fields": {
-                "Order Number": data.get('order_number'),
-                "Date": data.get('date'),
-                "Channel": data.get('channel'),
-                "Customer Email": data.get('customer_email'),
-                "Items": json.dumps(data.get('items', [])),
-                "Subtotal": data.get('subtotal', 0),
-                "Taxes": data.get('taxes', 0),
-                "Fees": data.get('fees', 0),
-                "Total": data.get('total', 0),
-                "Email Seq Num": data.get('email_seq_num'),
-                "Processed At": datetime.now().isoformat(),
-                "Processing Status": data.get('processing_status', 'airtable_complete'),
-                "Inventory Items Count": data.get('inventory_items_count', 0),
-                # Review fields
-                "Requires Review": data.get('requires_review', False),
-                "Confidence Score": data.get('
+        return ' | '.join(notes) if notes else ""
