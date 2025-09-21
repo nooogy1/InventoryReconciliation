@@ -19,13 +19,34 @@ class ZohoClient:
         self.config = config
         self.organization_id = config.get('ZOHO_ORGANIZATION_ID')
         self.access_token = None
-        self.base_url = "https://inventory.zohoapis.com/api/v1"
+        
+        # FIX: Use correct Zoho API endpoint from official documentation
+        # OLD: self.base_url = "https://inventory.zohoapis.com/api/v1"
+        self.base_url = "https://www.zohoapis.com/inventory/v1"
+        
         self.api_region = config.get('ZOHO_API_REGION', 'com')
         self.is_available = False  # Track if Zoho is available
         
-        # Adjust base URL for region
+        # FIX: Adjust base URL for different regions correctly according to documentation
         if self.api_region != 'com':
-            self.base_url = f"https://inventory.zohoapis.{self.api_region}/api/v1"
+            if self.api_region == 'eu':
+                self.base_url = "https://www.zohoapis.eu/inventory/v1"
+            elif self.api_region == 'in':
+                self.base_url = "https://www.zohoapis.in/inventory/v1"
+            elif self.api_region == 'au':
+                self.base_url = "https://www.zohoapis.com.au/inventory/v1"
+            elif self.api_region == 'jp':
+                self.base_url = "https://www.zohoapis.jp/inventory/v1"
+            elif self.api_region == 'ca':
+                self.base_url = "https://www.zohoapis.ca/inventory/v1"
+            elif self.api_region == 'cn':
+                self.base_url = "https://www.zohoapis.com.cn/inventory/v1"
+            elif self.api_region == 'sa':
+                self.base_url = "https://www.zohoapis.sa/inventory/v1"
+            else:
+                # Default to .com if unknown region
+                logger.warning(f"Unknown API region '{self.api_region}', defaulting to 'com'")
+                self.base_url = "https://www.zohoapis.com/inventory/v1"
             
         # Simplified cache - mainly for items by SKU
         self._cache = {
@@ -38,6 +59,7 @@ class ZohoClient:
         self.use_physical_stock = config.get_bool('ZOHO_USE_PHYSICAL_STOCK', True)
         
         logger.info(f"🔧 Initializing Zoho client (Sequential Mode)...")
+        logger.info(f"   - Base URL: {self.base_url}")
         logger.info(f"   - Organization ID: {self.organization_id}")
         logger.info(f"   - API Region: {self.api_region}")
         logger.info(f"   - Mode: Simplified for clean Airtable data")
@@ -64,7 +86,26 @@ class ZohoClient:
             return
             
         try:
-            url = f"https://accounts.zohoapis.{self.api_region}/oauth/v2/token"
+            # FIX: Use correct OAuth endpoint based on region
+            if self.api_region == 'com':
+                token_url = "https://accounts.zoho.com/oauth/v2/token"
+            elif self.api_region == 'eu':
+                token_url = "https://accounts.zoho.eu/oauth/v2/token"
+            elif self.api_region == 'in':
+                token_url = "https://accounts.zoho.in/oauth/v2/token"
+            elif self.api_region == 'au':
+                token_url = "https://accounts.zoho.com.au/oauth/v2/token"
+            elif self.api_region == 'jp':
+                token_url = "https://accounts.zoho.jp/oauth/v2/token"
+            elif self.api_region == 'ca':
+                token_url = "https://accounts.zoho.ca/oauth/v2/token"
+            elif self.api_region == 'cn':
+                token_url = "https://accounts.zoho.com.cn/oauth/v2/token"
+            elif self.api_region == 'sa':
+                token_url = "https://accounts.zoho.sa/oauth/v2/token"
+            else:
+                token_url = "https://accounts.zoho.com/oauth/v2/token"
+            
             data = {
                 "refresh_token": self.config.get('ZOHO_REFRESH_TOKEN'),
                 "client_id": self.config.get('ZOHO_CLIENT_ID'),
@@ -72,7 +113,8 @@ class ZohoClient:
                 "grant_type": "refresh_token"
             }
             
-            response = requests.post(url, data=data, timeout=10)
+            logger.debug(f"Requesting token from: {token_url}")
+            response = requests.post(token_url, data=data, timeout=10)
             response.raise_for_status()
             
             token_data = response.json()
@@ -108,6 +150,9 @@ class ZohoClient:
         params['organization_id'] = self.organization_id
         
         try:
+            # FIX: Add better error handling and logging
+            logger.debug(f"Making {method} request to: {url}")
+            
             response = requests.request(
                 method=method,
                 url=url,
@@ -130,209 +175,170 @@ class ZohoClient:
             logger.warning(f"Network issue with Zoho API: {e}")
             self.is_available = False
             raise
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error for {method} {endpoint}: {e}")
+            if hasattr(e, 'response') and e.response:
+                logger.error(f"Response status: {e.response.status_code}")
+                logger.error(f"Response content: {e.response.text}")
+            raise
         except Exception as e:
             logger.error(f"Zoho API error for {method} {endpoint}: {e}")
             raise
         
     def _load_tax_configuration(self):
         """Load tax configuration from Zoho."""
-        if not self.is_available:
-            logger.debug("Zoho not available, skipping tax configuration")
-            return
-            
         try:
             response = self._make_api_request('GET', 'settings/taxes')
             taxes = response.get('taxes', [])
             
             with self._cache_lock:
-                self._cache['taxes'] = {tax['tax_id']: tax for tax in taxes}
-                
-            logger.info(f"✅ Loaded {len(taxes)} tax configurations")
+                self._cache['taxes'] = {
+                    tax['tax_id']: tax for tax in taxes
+                }
             
-        except requests.exceptions.HTTPError as e:
-            if e.response and e.response.status_code == 400:
-                logger.warning("⚠️ Could not load tax configuration (400 error)")
-                logger.warning("   Tax operations will use default settings")
-                with self._cache_lock:
-                    self._cache['taxes'] = {}
-            else:
-                logger.warning(f"Could not load tax configuration: {e}")
-                with self._cache_lock:
-                    self._cache['taxes'] = {}
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError) as e:
-            logger.warning(f"Network issue loading tax configuration: {e}")
-            self.is_available = False
-            with self._cache_lock:
-                self._cache['taxes'] = {}
+            logger.info(f"💰 Loaded {len(taxes)} tax configurations from Zoho")
+            
         except Exception as e:
-            logger.warning(f"Could not load tax configuration: {e}")
-            with self._cache_lock:
-                self._cache['taxes'] = {}
-                
-    def process_complete_data(self, data: Dict, transaction_type: str) -> Dict:
+            logger.warning(f"⚠️ Could not load tax configuration: {e}")
+            # Don't fail initialization for this
+    
+    def test_connection(self) -> bool:
+        """Test Zoho API connection and return status."""
+        try:
+            # Try to fetch taxes as a simple connection test
+            response = self._make_api_request('GET', 'settings/taxes')
+            logger.info("✅ Zoho connection test successful")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Zoho connection test failed: {e}")
+            return False
+
+    def process_complete_data(self, clean_data: Dict, transaction_type: str) -> Dict:
         """
-        Process clean data from Airtable.
-        
-        This method now expects clean, validated data with SKUs already assigned.
+        Process clean data from Airtable through Zoho.
         
         Args:
-            data: Clean data from Airtable with guaranteed SKUs
+            clean_data: Clean, validated data from Airtable
             transaction_type: 'purchase' or 'sale'
             
         Returns:
-            Dictionary with processing results
+            Dict with processing results
         """
-        order_number = data.get('order_number', 'N/A')
-        logger.info(f"🔄 Processing clean {transaction_type} data from Airtable")
-        logger.info(f"   - Order: {order_number}")
-        
         result = {
             'success': False,
-            'stock_adjusted': False,
             'items_processed': [],
-            'items_failed': [],
-            'errors': [],
-            'warnings': []
+            'stock_adjusted': False,
+            'adjustment_id': None,
+            'revenue': 0,
+            'cogs': 0,
+            'errors': []
         }
         
-        # Check if Zoho is available
         if not self.is_available:
-            result['errors'].append("Zoho API is not available - network/DNS issue")
-            result['warnings'].append("Data has been saved to Airtable but NOT synced to Zoho")
-            logger.warning("⚠️ Zoho not available - skipping inventory sync")
+            result['errors'].append("Zoho API is not available")
             return result
-        
+            
         try:
             if transaction_type == 'purchase':
-                result = self._process_purchase_from_airtable(data)
+                return self._process_purchase_from_airtable(clean_data)
             elif transaction_type == 'sale':
-                result = self._process_sale_from_airtable(data)
+                return self._process_sale_from_airtable(clean_data)
             else:
                 result['errors'].append(f"Unknown transaction type: {transaction_type}")
                 
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError) as e:
-            result['errors'].append(f"Network error processing {transaction_type}: {e}")
-            result['warnings'].append("Zoho became unavailable during processing")
-            logger.warning(f"⚠️ Network issue during Zoho processing: {e}")
-            self.is_available = False
         except Exception as e:
-            result['errors'].append(str(e))
-            logger.error(f"Error processing clean data: {e}")
+            result['errors'].append(f"Processing error: {e}")
+            logger.error(f"💥 Failed to process {transaction_type}: {e}", exc_info=True)
             
         return result
-        
-    def _process_purchase_from_airtable(self, data: Dict) -> Dict:
-        """
-        Process purchase using clean Airtable data.
-        
-        Args:
-            data: Clean purchase data with SKUs assigned by Airtable
-            
-        Returns:
-            Processing result dictionary
-        """
-        order_number = data.get('order_number', 'N/A')
-        
-        logger.info(f"📦 Processing purchase from Airtable data:")
-        logger.info(f"   - Order: {order_number}")
-        
+
+    def _process_purchase_from_airtable(self, airtable_data: Dict) -> Dict:
+        """Process purchase from clean Airtable data."""
         result = {
             'success': False,
-            'stock_adjusted': False,
             'items_processed': [],
-            'items_failed': [],
-            'errors': [],
-            'warnings': [],
-            'adjustment_id': None
+            'stock_adjusted': False,
+            'adjustment_id': None,
+            'errors': []
         }
         
+        logger.info("🔄 Processing clean purchase data from Airtable")
+        logger.info(f"   - Order: {airtable_data.get('order_number', 'N/A')}")
+        
         try:
-            # Process each item with guaranteed SKUs
-            adjustment_items = []
-            total_cost = 0
+            items_for_adjustment = []
             
-            items = data.get('items', [])
-            logger.info(f"📋 Processing {len(items)} items with assigned SKUs...")
+            logger.info(f"📋 Processing {len(airtable_data.get('items', []))} items with assigned SKUs...")
             
-            for i, item in enumerate(items, 1):
-                item_name = item.get('name', f'Item {i}')
-                item_sku = item.get('sku')  # Guaranteed to exist from Airtable
+            for i, item in enumerate(airtable_data.get('items', []), 1):
+                name = item.get('name')
+                sku = item.get('sku')
+                quantity = item.get('quantity', 0)
+                unit_price = item.get('unit_price', 0)
                 
-                logger.info(f"   [{i}/{len(items)}] Processing: {item_name}")
-                logger.info(f"      - SKU: {item_sku}")
-                
-                if not item_sku:
-                    error_msg = f"No SKU provided for item {item_name}"
-                    result['items_failed'].append({
-                        'name': item_name,
-                        'error': error_msg
-                    })
-                    result['warnings'].append(error_msg)
-                    logger.error(f"      ❌ {error_msg}")
-                    continue
+                logger.info(f"   [{i}/{len(airtable_data['items'])}] Processing: {name}")
+                logger.info(f"      - SKU: {sku}")
                 
                 try:
-                    # Find or create item in Zoho
-                    item_id = self._ensure_item_exists_in_zoho(item_sku, item_name)
+                    # Ensure item exists in Zoho
+                    item_id = self._ensure_item_exists_in_zoho(sku, name)
                     
-                    logger.info(f"      - Zoho Item ID: {item_id}")
+                    # Get current item details for WAC calculation
+                    item_details = self._get_item_details(item_id)
                     
-                    # Calculate item cost
-                    quantity = item.get('quantity', 0)
-                    unit_price = item.get('unit_price', 0)
-                    
-                    logger.info(f"      - Quantity: {quantity}")
-                    logger.info(f"      - Unit price: ${unit_price:.2f}")
-                    
-                    # Add to adjustment
-                    adjustment_items.append({
+                    items_for_adjustment.append({
                         'item_id': item_id,
+                        'name': name,
+                        'sku': sku,
                         'quantity_adjusted': quantity,
-                        'new_rate': unit_price,
-                        'notes': f"Purchase from Airtable: {order_number}"
+                        'rate': unit_price,
+                        'current_stock': item_details.get('stock_on_hand', 0),
+                        'current_rate': item_details.get('rate', 0)
                     })
                     
-                    total_cost += quantity * unit_price
-                    
                     result['items_processed'].append({
-                        'name': item_name,
-                        'sku': item_sku,
+                        'item_id': item_id,
+                        'sku': sku,
+                        'name': name,
                         'quantity': quantity,
-                        'unit_cost': unit_price
+                        'unit_price': unit_price
                     })
                     
                     logger.info(f"      ✅ Item processed successfully")
                     
                 except Exception as e:
-                    error_msg = f"Failed to process item {item_name}: {e}"
-                    result['items_failed'].append({
-                        'name': item_name,
-                        'error': str(e)
-                    })
-                    result['warnings'].append(error_msg)
-                    logger.error(f"      ❌ {error_msg}")
+                    result['errors'].append(f"Failed to process item {name}: {e}")
+                    logger.error(f"      ❌ Failed to process item {name}: {e}")
                     
-            # Create stock adjustment if we have items
-            if adjustment_items:
-                logger.info(f"📈 Creating stock adjustment with {len(adjustment_items)} items...")
-                
+            if items_for_adjustment:
+                # Create inventory adjustment for stock increase
                 try:
                     adjustment_data = {
-                        'date': data.get('date', datetime.now().strftime('%Y-%m-%d')),
-                        'reason': 'Stock Received',
-                        'description': f"Purchase from Airtable: {order_number}",
+                        'date': datetime.now().strftime('%Y-%m-%d'),
+                        'reason': 'Purchase - Stock Received',
                         'adjustment_type': 'quantity',
-                        'line_items': adjustment_items,
-                        'reference_number': order_number,
-                        'notes': f"Processed via Airtable → Zoho workflow"
+                        'line_items': []
                     }
                     
+                    # Generate reference number
+                    order_ref = airtable_data.get('order_number', 'UNKNOWN')
+                    adjustment_data['reference_number'] = f"PURCHASE-{order_ref}-{datetime.now().strftime('%Y%m%d')}"
+                    
+                    for item in items_for_adjustment:
+                        adjustment_data['line_items'].append({
+                            'item_id': item['item_id'],
+                            'quantity_adjusted': item['quantity_adjusted'],
+                            'rate': item['rate']
+                        })
+                    
+                    logger.info(f"📈 Creating stock adjustment:")
+                    logger.info(f"   - Type: Purchase (Stock Increase)")
                     logger.info(f"   - Date: {adjustment_data['date']}")
                     logger.info(f"   - Reference: {adjustment_data['reference_number']}")
                     
                     # Create the adjustment
                     adjustment_response = self._make_api_request(
-                        'POST', 
+                        'POST',
                         'inventoryadjustments',
                         adjustment_data
                     )
@@ -343,7 +349,6 @@ class ZohoClient:
                     
                     logger.info(f"✅ Stock adjustment created successfully:")
                     logger.info(f"   - Adjustment ID: {result['adjustment_id']}")
-                    logger.info(f"   - Total cost: ${total_cost:.2f}")
                     
                 except Exception as e:
                     result['errors'].append(f"Failed to create stock adjustment: {e}")
@@ -358,143 +363,103 @@ class ZohoClient:
             logger.error(f"💥 Failed to process purchase: {e}", exc_info=True)
             
         return result
-        
-    def _process_sale_from_airtable(self, data: Dict) -> Dict:
-        """
-        Process sale using clean Airtable data.
-        
-        Args:
-            data: Clean sales data with SKUs assigned by Airtable
-            
-        Returns:
-            Processing result dictionary
-        """
-        order_number = data.get('order_number', 'N/A')
-        
-        logger.info(f"💰 Processing sale from Airtable data:")
-        logger.info(f"   - Order: {order_number}")
-        
+
+    def _process_sale_from_airtable(self, airtable_data: Dict) -> Dict:
+        """Process sale from clean Airtable data."""
         result = {
             'success': False,
-            'stock_adjusted': False,
             'items_processed': [],
-            'items_failed': [],
-            'errors': [],
-            'warnings': [],
+            'stock_adjusted': False,
             'adjustment_id': None,
             'revenue': 0,
-            'cogs': 0
+            'cogs': 0,
+            'errors': []
         }
         
+        logger.info("🔄 Processing clean sale data from Airtable")
+        logger.info(f"   - Order: {airtable_data.get('order_number', 'N/A')}")
+        
         try:
-            # Process each item with guaranteed SKUs
-            adjustment_items = []
+            items_for_adjustment = []
             total_revenue = 0
             total_cogs = 0
             
-            items = data.get('items', [])
-            logger.info(f"📋 Processing {len(items)} items with assigned SKUs...")
+            logger.info(f"📋 Processing {len(airtable_data.get('items', []))} items with assigned SKUs...")
             
-            for i, item in enumerate(items, 1):
-                item_name = item.get('name', f'Item {i}')
-                item_sku = item.get('sku')  # Guaranteed to exist from Airtable
+            for i, item in enumerate(airtable_data.get('items', []), 1):
+                name = item.get('name')
+                sku = item.get('sku')
+                quantity = item.get('quantity', 0)
+                sale_price = item.get('sale_price', 0)
                 
-                logger.info(f"   [{i}/{len(items)}] Processing: {item_name}")
-                logger.info(f"      - SKU: {item_sku}")
-                
-                if not item_sku:
-                    error_msg = f"No SKU provided for item {item_name}"
-                    result['items_failed'].append({
-                        'name': item_name,
-                        'error': error_msg
-                    })
-                    result['warnings'].append(error_msg)
-                    logger.error(f"      ❌ {error_msg}")
-                    continue
+                logger.info(f"   [{i}/{len(airtable_data['items'])}] Processing: {name}")
+                logger.info(f"      - SKU: {sku}")
                 
                 try:
-                    # Find item in Zoho
-                    item_id = self._find_item_by_sku(item_sku)
+                    # Ensure item exists in Zoho
+                    item_id = self._ensure_item_exists_in_zoho(sku, name)
                     
-                    if not item_id:
-                        # Create item if it doesn't exist
-                        item_id = self._ensure_item_exists_in_zoho(item_sku, item_name)
-                        
-                    # Get current stock and cost
+                    # Get current item details for WAC calculation
                     item_details = self._get_item_details(item_id)
-                    current_stock = item_details.get('stock_on_hand', 0)
-                    current_cost = item_details.get('purchase_rate', 0)
-                    
-                    quantity = item.get('quantity', 0)
-                    sale_price = item.get('sale_price', 0)
-                    
-                    logger.info(f"      - Zoho Item ID: {item_id}")
-                    logger.info(f"      - Current stock: {current_stock}")
-                    logger.info(f"      - Current cost: ${current_cost:.2f}")
-                    logger.info(f"      - Sale quantity: {quantity}")
-                    logger.info(f"      - Sale price: ${sale_price:.2f}")
-                    
-                    # Check if we have sufficient stock
-                    if current_stock < quantity:
-                        warning_msg = (
-                            f"Insufficient stock for {item_name}: "
-                            f"have {current_stock}, need {quantity}"
-                        )
-                        result['warnings'].append(warning_msg)
-                        logger.warning(f"      ⚠️ {warning_msg}")
-                        
-                    # Add to adjustment (negative for sales)
-                    adjustment_items.append({
-                        'item_id': item_id,
-                        'quantity_adjusted': -quantity,  # Negative for reduction
-                        'notes': f"Sale from Airtable: {order_number}"
-                    })
+                    current_rate = item_details.get('rate', 0)
                     
                     # Calculate revenue and COGS
                     item_revenue = quantity * sale_price
-                    item_cogs = quantity * current_cost
+                    item_cogs = quantity * current_rate
                     
                     total_revenue += item_revenue
                     total_cogs += item_cogs
                     
-                    result['items_processed'].append({
-                        'name': item_name,
-                        'sku': item_sku,
-                        'quantity': quantity,
+                    items_for_adjustment.append({
+                        'item_id': item_id,
+                        'name': name,
+                        'sku': sku,
+                        'quantity_adjusted': -quantity,  # Negative for sale
+                        'rate': current_rate,  # Use WAC for COGS
                         'sale_price': sale_price,
-                        'cost': current_cost,
-                        'profit': item_revenue - item_cogs
+                        'revenue': item_revenue,
+                        'cogs': item_cogs
                     })
                     
-                    logger.info(f"      - Revenue: ${item_revenue:.2f}")
-                    logger.info(f"      - COGS: ${item_cogs:.2f}")
-                    logger.info(f"      - Profit: ${item_revenue - item_cogs:.2f}")
+                    result['items_processed'].append({
+                        'item_id': item_id,
+                        'sku': sku,
+                        'name': name,
+                        'quantity': quantity,
+                        'sale_price': sale_price,
+                        'cogs': item_cogs,
+                        'revenue': item_revenue
+                    })
+                    
                     logger.info(f"      ✅ Item processed successfully")
                     
                 except Exception as e:
-                    error_msg = f"Failed to process item {item_name}: {e}"
-                    result['items_failed'].append({
-                        'name': item_name,
-                        'error': str(e)
-                    })
-                    result['warnings'].append(error_msg)
-                    logger.error(f"      ❌ {error_msg}")
+                    result['errors'].append(f"Failed to process item {name}: {e}")
+                    logger.error(f"      ❌ Failed to process item {name}: {e}")
                     
-            # Create stock adjustment if we have items
-            if adjustment_items:
-                logger.info(f"📉 Creating stock adjustment with {len(adjustment_items)} items...")
-                
+            if items_for_adjustment:
+                # Create inventory adjustment for stock decrease
                 try:
                     adjustment_data = {
-                        'date': data.get('date', datetime.now().strftime('%Y-%m-%d')),
-                        'reason': 'Goods Sold',
-                        'description': f"Sale from Airtable: {order_number}",
+                        'date': datetime.now().strftime('%Y-%m-%d'),
+                        'reason': 'Sale - Stock Sold',
                         'adjustment_type': 'quantity',
-                        'line_items': adjustment_items,
-                        'reference_number': order_number,
-                        'notes': f"Processed via Airtable → Zoho workflow"
+                        'line_items': []
                     }
                     
+                    # Generate reference number
+                    order_ref = airtable_data.get('order_number', 'UNKNOWN')
+                    adjustment_data['reference_number'] = f"SALE-{order_ref}-{datetime.now().strftime('%Y%m%d')}"
+                    
+                    for item in items_for_adjustment:
+                        adjustment_data['line_items'].append({
+                            'item_id': item['item_id'],
+                            'quantity_adjusted': item['quantity_adjusted'],  # Negative
+                            'rate': item['rate']  # WAC rate for COGS
+                        })
+                    
+                    logger.info(f"📉 Creating stock adjustment:")
+                    logger.info(f"   - Type: Sale (Stock Decrease)")
                     logger.info(f"   - Date: {adjustment_data['date']}")
                     logger.info(f"   - Reference: {adjustment_data['reference_number']}")
                     
@@ -530,7 +495,7 @@ class ZohoClient:
             logger.error(f"💥 Failed to process sale: {e}", exc_info=True)
             
         return result
-        
+
     def _ensure_item_exists_in_zoho(self, sku: str, name: str) -> str:
         """
         Ensure item exists in Zoho, create if necessary.
