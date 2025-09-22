@@ -1,4 +1,4 @@
-"""Zoho Inventory client with proper Purchase Order and Sales Order workflows."""
+"""Zoho Inventory client with proper Purchase Order and Sales Order workflows and GitHub Gist token caching."""
 
 import logging
 import requests
@@ -9,16 +9,30 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from threading import Lock
 
+# Import the GitHub Gist token manager
+from .github_token_manager import GitHubGistTokenManager
+
 logger = logging.getLogger(__name__)
 
 
 class ZohoClient:
-    """Handle Zoho Inventory API with proper accounting workflows."""
+    """Handle Zoho Inventory API with proper accounting workflows and efficient token management."""
     
     def __init__(self, config):
         self.config = config
         self.organization_id = config.get('ZOHO_ORGANIZATION_ID')
         self.access_token = None
+        
+        # Initialize GitHub Gist token manager
+        try:
+            self.token_manager = GitHubGistTokenManager(config)
+            self.use_token_caching = True
+            logger.info("GitHub Gist token caching enabled")
+        except ValueError as e:
+            logger.warning(f"GitHub Gist token caching disabled: {e}")
+            logger.warning("Falling back to refresh-on-every-call method")
+            self.token_manager = None
+            self.use_token_caching = False
         
         # Correct Zoho API endpoint from official documentation
         self.base_url = "https://www.zohoapis.com/inventory/v1"
@@ -90,10 +104,138 @@ class ZohoClient:
             
         return self.is_available
 
-    def _refresh_access_token(self) -> bool:
-        """Refresh OAuth2 access token using refresh token."""
+    def _ensure_access_token(self) -> bool:
+        """
+        Ensure we have a valid access token using GitHub Gist caching.
+        
+        Returns:
+            True if valid token available, False otherwise
+        """
+        if self.use_token_caching and self.token_manager:
+            return self._get_cached_or_refresh_token()
+        else:
+            return self._refresh_access_token_legacy()
+
+    def _get_cached_or_refresh_token(self) -> bool:
+        """
+        Get token from cache or refresh if needed.
+        
+        Returns:
+            True if valid token obtained, False otherwise
+        """
         try:
-            auth_url = "https://accounts.zoho.com/oauth/v2/token"
+            # Step 1: Try to get cached token
+            logger.debug("Checking for cached access token...")
+            cached_token = self.token_manager.get_cached_token()
+            
+            if cached_token:
+                # Step 2: Validate cached token with a simple API call
+                test_token = cached_token['access_token']
+                if self._validate_token(test_token):
+                    logger.info("Using valid cached access token")
+                    self.access_token = test_token
+                    return True
+                else:
+                    logger.info("Cached token is invalid, refreshing...")
+            else:
+                logger.info("No cached token found, refreshing...")
+            
+            # Step 3: Refresh token if cache miss or invalid
+            if self._refresh_access_token_and_cache():
+                return True
+            
+            logger.error("Failed to obtain valid access token")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error in token management: {e}")
+            # Fallback to legacy refresh
+            return self._refresh_access_token_legacy()
+
+    def _validate_token(self, token: str) -> bool:
+        """
+        Validate an access token with a lightweight API call.
+        
+        Args:
+            token: Access token to validate
+            
+        Returns:
+            True if token is valid, False otherwise
+        """
+        try:
+            headers = {
+                "Authorization": f"Zoho-oauthtoken {token}",
+                "Content-Type": "application/json"
+            }
+            
+            # Use a lightweight endpoint to test token
+            response = requests.get(
+                f"{self.base_url}/organizations",
+                headers=headers,
+                timeout=10
+            )
+            
+            return response.status_code == 200
+            
+        except Exception as e:
+            logger.debug(f"Token validation failed: {e}")
+            return False
+
+    def _refresh_access_token_and_cache(self) -> bool:
+        """
+        Refresh access token and cache it to GitHub Gist.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            logger.info("Refreshing Zoho access token...")
+            
+            auth_url = f"https://accounts.zoho.{self.api_region}/oauth/v2/token"
+            
+            data = {
+                'refresh_token': self.config.get('ZOHO_REFRESH_TOKEN'),
+                'client_id': self.config.get('ZOHO_CLIENT_ID'),
+                'client_secret': self.config.get('ZOHO_CLIENT_SECRET'),
+                'grant_type': 'refresh_token'
+            }
+            
+            response = requests.post(auth_url, data=data, timeout=30)
+            response.raise_for_status()
+            
+            token_data = response.json()
+            access_token = token_data.get('access_token')
+            expires_in = token_data.get('expires_in', 3600)
+            
+            if not access_token:
+                logger.error("No access token in refresh response")
+                return False
+            
+            # Cache the new token
+            if self.token_manager.cache_token(access_token, expires_in):
+                logger.info("New access token cached successfully")
+            else:
+                logger.warning("Failed to cache new access token, but will continue")
+            
+            self.access_token = access_token
+            logger.info("Zoho access token refreshed successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to refresh access token: {e}")
+            return False
+
+    def _refresh_access_token_legacy(self) -> bool:
+        """
+        Legacy token refresh method (refresh on every call).
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            logger.debug("Using legacy token refresh (no caching)")
+            
+            auth_url = f"https://accounts.zoho.{self.api_region}/oauth/v2/token"
             
             data = {
                 'refresh_token': self.config.get('ZOHO_REFRESH_TOKEN'),
@@ -109,14 +251,14 @@ class ZohoClient:
             self.access_token = token_data.get('access_token')
             
             if self.access_token:
-                logger.info("🔑 Zoho access token refreshed successfully")
+                logger.debug("Legacy token refresh successful")
                 return True
             else:
-                logger.error("❌ Failed to get access token from response")
+                logger.error("No access token in legacy refresh response")
                 return False
                 
         except Exception as e:
-            logger.error(f"❌ Failed to refresh Zoho access token: {e}")
+            logger.error(f"Legacy token refresh failed: {e}")
             return False
     
     def _get_headers(self) -> Dict[str, str]:
