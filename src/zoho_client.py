@@ -24,7 +24,7 @@ class ZohoClient:
         self.base_url = "https://www.zohoapis.com/inventory/v1"
         
         self.api_region = config.get('ZOHO_API_REGION', 'com')
-        self.is_available = False  # Track if Zoho is available
+        self.is_available = None  # Will be determined lazily when first needed
         
         # Adjust base URL for different regions
         if self.api_region != 'com':
@@ -67,12 +67,28 @@ class ZohoClient:
         logger.info(f"   - Auto Create Bills: {self.auto_create_bills}")
         logger.info(f"   - Auto Create Invoices: {self.auto_create_invoices}")
         logger.info(f"   - Allow Direct Adjustments: {self.allow_direct_adjustments}")
+        logger.info(f"   - Connection: Lazy (will connect when needed)")
+
+    def _ensure_connection(self) -> bool:
+        """Ensure Zoho connection is available - only connects when first needed."""
+        if self.is_available is not None:
+            return self.is_available
+            
+        logger.info("🔗 First Zoho API access - establishing connection...")
         
         # Initialize connection
         if self._refresh_access_token():
             self.is_available = self.test_connection()
             if self.is_available:
                 self._load_cache()
+                logger.info("✅ Zoho connection established successfully")
+            else:
+                logger.warning("⚠️ Zoho connection failed - will retry on next API call")
+        else:
+            self.is_available = False
+            logger.error("❌ Failed to get Zoho access token")
+            
+        return self.is_available
 
     def _refresh_access_token(self) -> bool:
         """Refresh OAuth2 access token using refresh token."""
@@ -213,7 +229,8 @@ class ZohoClient:
             'workflow_steps': []
         }
         
-        if not self.is_available:
+        # Lazy connection - only connect when we actually need to process data
+        if not self._ensure_connection():
             result['errors'].append("Zoho API is not available")
             return result
             
