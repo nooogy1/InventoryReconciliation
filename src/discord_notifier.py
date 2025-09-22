@@ -1,524 +1,494 @@
-"""Discord notification client with robust error handling and formatting."""
+"""Enhanced Discord notifications for proper Purchase/Sales Order workflows."""
 
 import logging
 import requests
 import json
-import asyncio
-import httpx
-from typing import Dict, Optional, List, Any, Union
-from datetime import datetime, timezone
-from collections.abc import Mapping, Iterable
-from enum import Enum
+from typing import Dict, Optional, Any, List
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 
-class NotificationLevel(Enum):
-    """Notification severity levels."""
-    SUCCESS = ("✅", 0x00ff00)  # Green
-    WARNING = ("⚠️", 0xffaa00)  # Orange
-    ERROR = ("❌", 0xff0000)    # Red
-    INFO = ("ℹ️", 0x0099ff)     # Blue
-    DEBUG = ("🔍", 0x666666)    # Gray
-
-
 class DiscordNotifier:
-    """Send notifications to Discord webhook with robust formatting."""
-    
-    # Discord limits
-    MAX_DESCRIPTION_LENGTH = 2048
-    MAX_FIELD_VALUE_LENGTH = 1024
-    MAX_FIELD_NAME_LENGTH = 256
-    MAX_FIELDS = 25
-    MAX_EMBED_TOTAL = 6000
-    MAX_EMBEDS_PER_MESSAGE = 10
+    """Enhanced Discord notifications with workflow-specific messaging."""
     
     def __init__(self, config):
-        """
-        Initialize Discord notifier with validation.
-        
-        Args:
-            config: Configuration object
-            
-        Raises:
-            ValueError: If webhook URL is missing or invalid
-        """
+        self.config = config
         self.webhook_url = config.get('DISCORD_WEBHOOK_URL')
-        
-        # Validate webhook URL
-        if not self.webhook_url:
-            raise ValueError("Discord webhook URL is missing from configuration")
-            
-        if not self.webhook_url.startswith('https://discord.com/api/webhooks/'):
-            raise ValueError(f"Invalid Discord webhook URL format: {self.webhook_url}")
-            
-        # Configuration
+        self.mention_on_error = config.get('DISCORD_MENTION_ON_ERROR')
         self.retry_on_fail = config.get_bool('DISCORD_RETRY_ON_FAIL', True)
-        self.max_retries = config.get_int('DISCORD_MAX_RETRIES', 3)
-        self.retry_delay = config.get_int('DISCORD_RETRY_DELAY', 1)
-        self.include_timestamp = config.get_bool('DISCORD_INCLUDE_TIMESTAMP', True)
-        self.footer_text = config.get('DISCORD_FOOTER_TEXT', 'Inventory Reconciliation System')
-        self.mention_on_error = config.get('DISCORD_MENTION_ON_ERROR')  # User/role ID to mention
         
-        # Rate limiting
-        self._last_sent = None
-        self._min_interval = config.get_float('DISCORD_MIN_INTERVAL', 0.5)  # Min seconds between messages
-        
-        logger.info("Discord notifier initialized successfully")
-        
-    def send_success(self, message: str, data: Optional[Dict] = None, title: Optional[str] = None):
-        """Send success notification to Discord."""
-        self._send_notification(
-            level=NotificationLevel.SUCCESS,
-            message=message,
-            data=data,
-            title=title or "Success"
-        )
-        
-    def send_error(self, message: str, data: Optional[Dict] = None, title: Optional[str] = None):
-        """Send error notification to Discord with optional mention."""
-        # Add mention for errors if configured
-        content = None
-        if self.mention_on_error:
-            content = f"<@{self.mention_on_error}> Error detected!"
-            
-        self._send_notification(
-            level=NotificationLevel.ERROR,
-            message=message,
-            data=data,
-            title=title or "Error",
-            content=content
-        )
-        
-    def send_warning(self, message: str, data: Optional[Dict] = None, title: Optional[str] = None):
-        """Send warning notification to Discord."""
-        self._send_notification(
-            level=NotificationLevel.WARNING,
-            message=message,
-            data=data,
-            title=title or "Warning"
-        )
-        
-    def send_info(self, message: str, data: Optional[Dict] = None, title: Optional[str] = None):
-        """Send info notification to Discord."""
-        self._send_notification(
-            level=NotificationLevel.INFO,
-            message=message,
-            data=data,
-            title=title or "Information"
-        )
-        
-    def send_debug(self, message: str, data: Optional[Dict] = None):
-        """Send debug notification (only if debug logging is enabled)."""
-        if logger.isEnabledFor(logging.DEBUG):
-            self._send_notification(
-                level=NotificationLevel.DEBUG,
-                message=message,
-                data=data,
-                title="Debug"
-            )
-            
-    def _send_notification(self, level: NotificationLevel, message: str, 
-                          data: Optional[Dict] = None, title: Optional[str] = None,
-                          content: Optional[str] = None):
-        """
-        Internal method to send notification with proper formatting.
-        
-        Args:
-            level: Notification severity level
-            message: Main message text
-            data: Optional data dictionary for fields
-            title: Optional embed title override
-            content: Optional message content (outside embed)
-        """
-        emoji, color = level.value
-        
-        # Build embed
-        embed = {
-            "title": f"{emoji} {title}",
-            "description": self._truncate_text(message, self.MAX_DESCRIPTION_LENGTH),
-            "color": color
+        # Color codes for different message types
+        self.colors = {
+            'success': 0x28a745,      # Green
+            'warning': 0xffc107,      # Yellow  
+            'error': 0xdc3545,        # Red
+            'info': 0x17a2b8,         # Blue
+            'purchase': 0x6f42c1,     # Purple
+            'sale': 0x20c997          # Teal
         }
         
-        # Add timestamp if enabled
-        if self.include_timestamp:
-            # Proper ISO8601 format with Z suffix for UTC
-            embed["timestamp"] = datetime.now(timezone.utc).isoformat()
+        logger.info(f"📢 Discord notifier initialized")
+        
+    def test_webhook(self) -> bool:
+        """Test Discord webhook connectivity."""
+        if not self.webhook_url:
+            logger.warning("⚠️ No Discord webhook URL configured")
+            return False
             
-        # Add footer
-        if self.footer_text:
-            embed["footer"] = {
-                "text": self.footer_text
+        try:
+            test_embed = {
+                "title": "🔧 Connection Test",
+                "description": "Discord webhook is working correctly",
+                "color": self.colors['info'],
+                "timestamp": datetime.utcnow().isoformat()
             }
             
-        # Add fields from data
-        if data:
-            fields = self._create_fields(data)
-            if fields:
-                embed["fields"] = fields[:self.MAX_FIELDS]  # Discord limit
+            response = requests.post(
+                self.webhook_url,
+                json={"embeds": [test_embed]},
+                timeout=10
+            )
+            
+            if response.status_code == 204:
+                logger.info("✅ Discord webhook test successful")
+                return True
+            else:
+                logger.error(f"❌ Discord webhook test failed: {response.status_code}")
+                return False
                 
-        # Validate total embed size
-        embed = self._validate_embed_size(embed)
+        except Exception as e:
+            logger.error(f"❌ Discord webhook test failed: {e}")
+            return False
+
+    def send_success_notification(self, title: str, description: str, details: Dict[str, Any], 
+                                extra_info: Optional[Dict] = None):
+        """Send enhanced success notification with workflow details."""
         
-        # Build payload
-        payload = {"embeds": [embed]}
-        if content:
-            payload["content"] = content[:2000]  # Discord content limit
-            
-        # Apply rate limiting
-        self._apply_rate_limit()
-        
-        # Send webhook
-        self._send_webhook(payload, level)
-        
-    def _create_fields(self, data: Dict) -> List[Dict]:
-        """
-        Create embed fields from data dictionary.
-        
-        Args:
-            data: Data dictionary
-            
-        Returns:
-            List of field dictionaries
-        """
+        # Build fields from details
         fields = []
-        
-        for key, value in data.items():
-            # Skip certain keys
-            if key in ['items', 'body', 'parse_result', 'parse_metadata']:
-                continue
-                
-            # Format the field name
-            field_name = self._format_field_name(key)
-            
-            # Format the value based on type
-            field_value = self._format_field_value(value)
-            
-            # Skip empty values
-            if not field_value or field_value == "N/A":
-                continue
-                
+        for key, value in details.items():
             fields.append({
-                "name": self._truncate_text(field_name, self.MAX_FIELD_NAME_LENGTH),
-                "value": self._truncate_text(field_value, self.MAX_FIELD_VALUE_LENGTH),
+                "name": key,
+                "value": str(value),
                 "inline": True
             })
-            
-        return fields
         
-    def _format_field_name(self, key: str) -> str:
-        """Format field name for display."""
-        # Convert snake_case to Title Case
-        formatted = key.replace('_', ' ').title()
+        # Add workflow steps if provided
+        if extra_info and 'workflow_steps' in extra_info:
+            fields.append({
+                "name": "Workflow Steps",
+                "value": extra_info['workflow_steps'],
+                "inline": False
+            })
         
-        # Handle special cases
-        replacements = {
-            'Uid': 'UID',
-            'Id': 'ID',
-            'Url': 'URL',
-            'Api': 'API',
-            'Sku': 'SKU',
-            'Po': 'PO',
-            'So': 'SO'
-        }
-        
-        for old, new in replacements.items():
-            formatted = formatted.replace(old, new)
-            
-        return formatted
-        
-    def _format_field_value(self, value: Any) -> str:
-        """
-        Format field value for display.
-        
-        Args:
-            value: Value to format
-            
-        Returns:
-            Formatted string
-        """
-        if value is None:
-            return "N/A"
-            
-        # Handle different types
-        if isinstance(value, bool):
-            return "✅ Yes" if value else "❌ No"
-            
-        elif isinstance(value, (int, float)):
-            # Format numbers nicely
-            if isinstance(value, float):
-                # Check if it's a percentage (0-1 range confidence scores)
-                if 0 <= value <= 1 and 'confidence' in str(value):
-                    return f"{value:.1%}"
-                # Currency formatting for large numbers
-                elif value >= 1000:
-                    return f"${value:,.2f}"
-                else:
-                    return f"{value:.2f}"
-            else:
-                return f"{value:,}"
-                
-        elif isinstance(value, str):
-            return value
-            
-        elif isinstance(value, datetime):
-            # Format datetime nicely
-            return value.strftime("%Y-%m-%d %H:%M:%S UTC")
-            
-        elif isinstance(value, list):
-            # Format lists nicely
-            if len(value) == 0:
-                return "Empty"
-            elif len(value) <= 3:
-                return ", ".join(str(item) for item in value)
-            else:
-                return f"{', '.join(str(item) for item in value[:3])}, ... ({len(value)} total)"
-                
-        elif isinstance(value, dict):
-            # Format nested dicts as JSON
-            try:
-                formatted = json.dumps(value, indent=2, default=str)
-                if len(formatted) > 100:
-                    # Truncate long JSON
-                    return formatted[:97] + "..."
-                return f"```json\n{formatted}\n```"
-            except:
-                return str(value)
-                
-        else:
-            # Fallback to string representation
-            return str(value)
-            
-    def _truncate_text(self, text: str, max_length: int) -> str:
-        """
-        Truncate text to maximum length with ellipsis.
-        
-        Args:
-            text: Text to truncate
-            max_length: Maximum allowed length
-            
-        Returns:
-            Truncated text
-        """
-        if len(text) <= max_length:
-            return text
-            
-        # Leave room for ellipsis
-        return text[:max_length - 3] + "..."
-        
-    def _validate_embed_size(self, embed: Dict) -> Dict:
-        """
-        Validate and trim embed to Discord's size limits.
-        
-        Args:
-            embed: Embed dictionary
-            
-        Returns:
-            Validated embed
-        """
-        # Calculate total size
-        total_size = 0
-        
-        if 'title' in embed:
-            total_size += len(embed['title'])
-        if 'description' in embed:
-            total_size += len(embed['description'])
-        if 'footer' in embed and 'text' in embed['footer']:
-            total_size += len(embed['footer']['text'])
-        if 'author' in embed and 'name' in embed['author']:
-            total_size += len(embed['author']['name'])
-            
-        # Check fields
-        if 'fields' in embed:
-            for field in embed['fields']:
-                total_size += len(field.get('name', ''))
-                total_size += len(field.get('value', ''))
-                
-                # If we're over the limit, start trimming fields
-                if total_size > self.MAX_EMBED_TOTAL:
-                    # Remove this and remaining fields
-                    idx = embed['fields'].index(field)
-                    embed['fields'] = embed['fields'][:idx]
-                    embed['fields'].append({
-                        'name': 'Note',
-                        'value': f'... and {len(embed["fields"]) - idx} more fields (truncated)',
-                        'inline': False
-                    })
-                    break
-                    
-        return embed
-        
-    def _apply_rate_limit(self):
-        """Apply rate limiting to avoid Discord rate limits."""
-        if self._last_sent is not None:
-            elapsed = (datetime.now() - self._last_sent).total_seconds()
-            if elapsed < self._min_interval:
-                import time
-                time.sleep(self._min_interval - elapsed)
-                
-        self._last_sent = datetime.now()
-        
-    def _send_webhook(self, payload: Dict, level: NotificationLevel = NotificationLevel.INFO):
-        """
-        Send payload to Discord webhook with retry logic.
-        
-        Args:
-            payload: Webhook payload
-            level: Notification level for logging
-        """
-        attempt = 0
-        last_error = None
-        
-        while attempt < self.max_retries:
-            try:
-                response = requests.post(
-                    self.webhook_url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=10
-                )
-                
-                if response.status_code == 204:
-                    # Success with no content
-                    logger.debug(f"Discord notification sent successfully ({level.name})")
-                    return
-                    
-                elif response.status_code == 200:
-                    # Success with content (shouldn't happen for webhooks but handle it)
-                    logger.debug(f"Discord notification sent successfully ({level.name})")
-                    return
-                    
-                elif response.status_code == 429:
-                    # Rate limited
-                    retry_after = response.json().get('retry_after', 1)
-                    logger.warning(f"Discord rate limit hit, retrying after {retry_after}s")
-                    import time
-                    time.sleep(retry_after)
-                    attempt += 1
-                    continue
-                    
-                elif response.status_code >= 400:
-                    # Client error
-                    error_msg = f"Discord webhook failed: {response.status_code} - {response.text}"
-                    logger.error(error_msg)
-                    last_error = error_msg
-                    
-                    if not self.retry_on_fail:
-                        break
-                        
-                    attempt += 1
-                    if attempt < self.max_retries:
-                        import time
-                        time.sleep(self.retry_delay * attempt)
-                        
-            except requests.exceptions.Timeout:
-                last_error = "Discord webhook timeout"
-                logger.warning(last_error)
-                attempt += 1
-                
-            except requests.exceptions.ConnectionError as e:
-                last_error = f"Discord connection error: {e}"
-                logger.warning(last_error)
-                attempt += 1
-                
-            except Exception as e:
-                last_error = f"Unexpected error sending Discord notification: {e}"
-                logger.error(last_error, exc_info=True)
-                break
-                
-        if last_error:
-            logger.error(f"Failed to send Discord notification after {attempt} attempts: {last_error}")
-            
-    async def send_async(self, level: NotificationLevel, message: str, 
-                        data: Optional[Dict] = None, title: Optional[str] = None):
-        """
-        Async version of send notification.
-        
-        Args:
-            level: Notification severity level
-            message: Main message text
-            data: Optional data dictionary
-            title: Optional title override
-        """
-        emoji, color = level.value
-        
-        # Build embed (same as sync version)
         embed = {
-            "title": f"{emoji} {title or level.name.title()}",
-            "description": self._truncate_text(message, self.MAX_DESCRIPTION_LENGTH),
-            "color": color,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "title": title,
+            "description": description,
+            "color": self.colors['success'],
+            "fields": fields,
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {
+                "text": "Inventory System - Proper Workflows"
+            }
         }
         
-        if self.footer_text:
-            embed["footer"] = {"text": self.footer_text}
+        self._send_embed(embed)
+
+    def send_purchase_order_success(self, po_data: Dict, zoho_result: Dict):
+        """Send Purchase Order creation success notification."""
+        
+        order_number = po_data.get('order_number', 'Unknown')
+        vendor = po_data.get('vendor_name', 'Unknown')
+        
+        fields = [
+            {"name": "📋 PO Number", "value": zoho_result.get('purchase_order_id', 'Unknown'), "inline": True},
+            {"name": "👥 Vendor", "value": vendor, "inline": True},
+            {"name": "📦 Items", "value": len(zoho_result.get('items_processed', [])), "inline": True},
+            {"name": "🧾 Bill Generated", "value": "✅ Yes" if zoho_result.get('bill_id') else "❌ No", "inline": True},
+            {"name": "📈 Inventory Updated", "value": "✅ Yes", "inline": True},
+            {"name": "💰 COGS Method", "value": "FIFO (Zoho Native)", "inline": True}
+        ]
+        
+        # Add workflow steps
+        workflow_steps = "\n".join([f"• {step}" for step in zoho_result.get('workflow_steps', [])])
+        if workflow_steps:
+            fields.append({
+                "name": "🔄 Workflow Steps",
+                "value": workflow_steps,
+                "inline": False
+            })
+        
+        embed = {
+            "title": "✅ Purchase Order Created Successfully",
+            "description": f"**Order:** {order_number}",
+            "color": self.colors['purchase'],
+            "fields": fields,
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {
+                "text": "Purchase Workflow Complete"
+            }
+        }
+        
+        self._send_embed(embed)
+
+    def send_sales_order_success(self, so_data: Dict, zoho_result: Dict):
+        """Send Sales Order creation success notification."""
+        
+        order_number = so_data.get('order_number', 'Unknown')
+        channel = so_data.get('channel', 'Unknown')
+        
+        fields = [
+            {"name": "📋 SO Number", "value": zoho_result.get('sales_order_id', 'Unknown'), "inline": True},
+            {"name": "🏪 Channel", "value": channel, "inline": True},
+            {"name": "📦 Items", "value": len(zoho_result.get('items_processed', [])), "inline": True},
+            {"name": "🧾 Invoice Generated", "value": "✅ Yes" if zoho_result.get('invoice_id') else "❌ No", "inline": True},
+            {"name": "📦 Shipment Created", "value": "✅ Yes" if zoho_result.get('shipment_id') else "❌ No", "inline": True},
+            {"name": "💵 Revenue", "value": f"${zoho_result.get('revenue', 0):.2f}", "inline": True},
+            {"name": "💰 COGS", "value": f"${zoho_result.get('cogs', 0):.2f}", "inline": True},
+            {"name": "📈 Profit", "value": f"${zoho_result.get('revenue', 0) - zoho_result.get('cogs', 0):.2f}", "inline": True}
+        ]
+        
+        # Add workflow steps
+        workflow_steps = "\n".join([f"• {step}" for step in zoho_result.get('workflow_steps', [])])
+        if workflow_steps:
+            fields.append({
+                "name": "🔄 Workflow Steps",
+                "value": workflow_steps,
+                "inline": False
+            })
+        
+        embed = {
+            "title": "✅ Sales Order Created Successfully",
+            "description": f"**Order:** {order_number}",
+            "color": self.colors['sale'],
+            "fields": fields,
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {
+                "text": "Sales Workflow Complete"
+            }
+        }
+        
+        self._send_embed(embed)
+
+    def send_error_notification(self, title: str, description: str, details: Dict[str, Any]):
+        """Send error notification with action items."""
+        
+        # Add mention if configured
+        content = ""
+        if self.mention_on_error:
+            content = f"<@{self.mention_on_error}>"
+        
+        fields = []
+        for key, value in details.items():
+            # Handle lists and complex objects
+            if isinstance(value, list):
+                value = "\n".join([f"• {item}" for item in value[:5]])  # Limit to 5 items
+                if len(details.get(key, [])) > 5:
+                    value += f"\n... and {len(details[key]) - 5} more"
+            elif isinstance(value, dict):
+                value = json.dumps(value, indent=2)[:1000]  # Limit length
             
-        if data:
-            fields = self._create_fields(data)
-            if fields:
-                embed["fields"] = fields[:self.MAX_FIELDS]
-                
-        embed = self._validate_embed_size(embed)
-        payload = {"embeds": [embed]}
+            fields.append({
+                "name": key,
+                "value": str(value)[:1024],  # Discord field value limit
+                "inline": True if len(str(value)) < 50 else False
+            })
         
-        # Send using async client
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    self.webhook_url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=10
-                )
-                
-                if response.status_code not in [200, 204]:
-                    logger.error(f"Discord async webhook failed: {response.status_code}")
-                    
-            except Exception as e:
-                logger.error(f"Async Discord notification failed: {e}")
-                
-    def send_batch_summary(self, successes: int, warnings: int, errors: int, 
-                          details: Optional[Dict] = None):
-        """
-        Send a batch processing summary.
+        embed = {
+            "title": title,
+            "description": description,
+            "color": self.colors['error'],
+            "fields": fields,
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {
+                "text": "Error - Action Required"
+            }
+        }
         
-        Args:
-            successes: Number of successful operations
-            warnings: Number of warnings
-            errors: Number of errors
-            details: Optional additional details
-        """
-        # Determine overall status
-        if errors > 0:
-            level = NotificationLevel.ERROR
-            title = "Batch Processing Failed"
-        elif warnings > 0:
-            level = NotificationLevel.WARNING
-            title = "Batch Processing Complete with Warnings"
+        self._send_embed(embed, content)
+
+    def send_workflow_error(self, transaction_type: str, order_number: str, workflow_stage: str, 
+                          error_details: Dict, context: Dict):
+        """Send workflow-specific error notification."""
+        
+        content = f"<@{self.mention_on_error}>" if self.mention_on_error else ""
+        
+        if transaction_type == 'purchase':
+            title = "❌ Purchase Workflow Failed"
+            color = self.colors['purchase']
+            emoji = "🛒"
         else:
-            level = NotificationLevel.SUCCESS
-            title = "Batch Processing Complete"
-            
-        # Build summary message
-        message = f"Processed batch with:\n"
-        message += f"✅ {successes} successful\n"
-        if warnings > 0:
-            message += f"⚠️ {warnings} warnings\n"
-        if errors > 0:
-            message += f"❌ {errors} errors\n"
-            
-        # Add details if provided
-        summary_data = {
-            "Total Processed": successes + warnings + errors,
-            "Success Rate": f"{(successes / (successes + warnings + errors) * 100):.1f}%" if (successes + warnings + errors) > 0 else "N/A"
+            title = "❌ Sales Workflow Failed"
+            color = self.colors['sale']
+            emoji = "🛍️"
+        
+        fields = [
+            {"name": f"{emoji} Order", "value": order_number, "inline": True},
+            {"name": "🚫 Failed Stage", "value": workflow_stage, "inline": True},
+            {"name": "📊 Data Status", "value": "✅ Saved to Airtable", "inline": True}
+        ]
+        
+        # Add context fields
+        for key, value in context.items():
+            fields.append({
+                "name": key,
+                "value": str(value),
+                "inline": True
+            })
+        
+        # Add error details
+        error_text = "\n".join([f"• {error}" for error in error_details.get('errors', ['Unknown error'])[:3]])
+        fields.append({
+            "name": "🔍 Error Details",
+            "value": error_text,
+            "inline": False
+        })
+        
+        # Add action items
+        action_text = """
+**Action Required:**
+1. Check Zoho API connectivity
+2. Verify vendor/customer exists
+3. Review item configurations
+4. Retry from Airtable if needed
+        """
+        
+        fields.append({
+            "name": "⚠️ Next Steps",
+            "value": action_text,
+            "inline": False
+        })
+        
+        embed = {
+            "title": title,
+            "description": f"Failed to create {transaction_type} workflow in Zoho",
+            "color": color,
+            "fields": fields,
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {
+                "text": "Workflow Error - Manual Review Required"
+            }
         }
         
-        if details:
-            summary_data.update(details)
+        self._send_embed(embed, content)
+
+    def send_warning_notification(self, title: str, description: str, details: Dict[str, Any], 
+                                extra_info: Optional[Dict] = None):
+        """Send warning notification."""
+        
+        fields = []
+        for key, value in details.items():
+            if isinstance(value, list):
+                value = "\n".join([f"• {item}" for item in value[:5]])
             
-        self._send_notification(
-            level=level,
-            message=message,
-            data=summary_data,
-            title=title
-        )
+            fields.append({
+                "name": key,
+                "value": str(value),
+                "inline": True if len(str(value)) < 50 else False
+            })
+        
+        # Add extra info if provided
+        if extra_info:
+            for key, value in extra_info.items():
+                fields.append({
+                    "name": key,
+                    "value": str(value),
+                    "inline": False
+                })
+        
+        embed = {
+            "title": title,
+            "description": description,
+            "color": self.colors['warning'],
+            "fields": fields,
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {
+                "text": "Warning - Review Recommended"
+            }
+        }
+        
+        self._send_embed(embed)
+
+    def send_human_review_notification(self, transaction_type: str, order_number: str, 
+                                     missing_fields: List[str], record_id: str, confidence: float):
+        """Send human review required notification."""
+        
+        fields = [
+            {"name": "📋 Order", "value": order_number, "inline": True},
+            {"name": "📊 Type", "value": transaction_type.title(), "inline": True},
+            {"name": "🎯 Confidence", "value": f"{confidence:.1%}", "inline": True},
+            {"name": "❌ Missing Fields", "value": "\n".join([f"• {field}" for field in missing_fields]), "inline": False},
+            {"name": "🗃️ Airtable Record", "value": record_id, "inline": True}
+        ]
+        
+        action_text = f"""
+**Action Required:**
+1. Open Airtable record: `{record_id}`
+2. Fill missing fields: {', '.join(missing_fields)}
+3. Uncheck 'Requires Review' when complete
+4. System will auto-process within 5 minutes
+        """
+        
+        fields.append({
+            "name": "⚡ Action Steps",
+            "value": action_text,
+            "inline": False
+        })
+        
+        embed = {
+            "title": "⚠️ Human Review Required - Incomplete Data",
+            "description": f"Missing required fields for {transaction_type}",
+            "color": self.colors['warning'],
+            "fields": fields,
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {
+                "text": "Human Review Required"
+            }
+        }
+        
+        self._send_embed(embed)
+
+    def send_info_notification(self, title: str, description: str, details: Dict[str, Any]):
+        """Send informational notification."""
+        
+        fields = []
+        for key, value in details.items():
+            fields.append({
+                "name": key,
+                "value": str(value),
+                "inline": True
+            })
+        
+        embed = {
+            "title": title,
+            "description": description,
+            "color": self.colors['info'],
+            "fields": fields,
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {
+                "text": "System Information"
+            }
+        }
+        
+        self._send_embed(embed)
+
+    def send_validation_alert(self, validation_type: str, findings: Dict):
+        """Send validation check alerts."""
+        
+        if validation_type == "inventory_adjustments":
+            auto_adjustments = findings.get('auto_adjustments', 0)
+            
+            if auto_adjustments > 0:
+                fields = [
+                    {"name": "🔍 Total Adjustments", "value": findings.get('total_adjustments', 0), "inline": True},
+                    {"name": "⚠️ Auto-Generated", "value": auto_adjustments, "inline": True},
+                    {"name": "✅ Expected", "value": "0 (with proper workflows)", "inline": True}
+                ]
+                
+                if findings.get('auto_adjustment_ids'):
+                    adj_list = "\n".join([f"• {adj_id}" for adj_id in findings['auto_adjustment_ids'][:5]])
+                    fields.append({
+                        "name": "📋 Adjustment IDs",
+                        "value": adj_list,
+                        "inline": False
+                    })
+                
+                embed = {
+                    "title": "⚠️ Inventory Adjustments Found",
+                    "description": "Found auto-generated adjustments. With proper workflows, this should be zero.",
+                    "color": self.colors['warning'],
+                    "fields": fields,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "footer": {
+                        "text": "Validation Alert - Review Required"
+                    }
+                }
+                
+                self._send_embed(embed)
+        
+        elif validation_type == "inventory_sync":
+            discrepancies = findings.get('discrepancies', [])
+            
+            if discrepancies:
+                fields = [
+                    {"name": "🔍 Items Compared", "value": findings.get('items_compared', 0), "inline": True},
+                    {"name": "⚠️ Discrepancies", "value": len(discrepancies), "inline": True},
+                    {"name": "💰 Value Difference", "value": f"${findings.get('total_value_difference', 0):.2f}", "inline": True}
+                ]
+                
+                # Show first few discrepancies
+                if discrepancies:
+                    disc_list = "\n".join([f"• {disc['sku']}: AT={disc['airtable_qty']} ZO={disc['zoho_qty']}" 
+                                         for disc in discrepancies[:5]])
+                    fields.append({
+                        "name": "📋 Sample Discrepancies",
+                        "value": disc_list,
+                        "inline": False
+                    })
+                
+                embed = {
+                    "title": "⚠️ Inventory Sync Discrepancies",
+                    "description": "Found differences between Airtable and Zoho inventory levels",
+                    "color": self.colors['warning'],
+                    "fields": fields,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "footer": {
+                        "text": "Sync Validation - Review Required"
+                    }
+                }
+                
+                self._send_embed(embed)
+
+    def _send_embed(self, embed: Dict, content: str = ""):
+        """Send Discord embed message."""
+        if not self.webhook_url:
+            logger.warning("⚠️ No Discord webhook URL - skipping notification")
+            return
+        
+        payload = {"embeds": [embed]}
+        if content:
+            payload["content"] = content
+        
+        try:
+            response = requests.post(
+                self.webhook_url,
+                json=payload,
+                timeout=10
+            )
+            
+            if response.status_code == 204:
+                logger.debug("✅ Discord notification sent successfully")
+            else:
+                logger.error(f"❌ Discord notification failed: {response.status_code} - {response.text}")
+                
+                if self.retry_on_fail and response.status_code != 429:  # Don't retry rate limits
+                    logger.info("🔄 Retrying Discord notification...")
+                    time.sleep(2)
+                    requests.post(self.webhook_url, json=payload, timeout=10)
+                    
+        except Exception as e:
+            logger.error(f"💥 Failed to send Discord notification: {e}")
+            if self.retry_on_fail:
+                try:
+                    logger.info("🔄 Retrying Discord notification after error...")
+                    time.sleep(5)
+                    requests.post(self.webhook_url, json=payload, timeout=10)
+                except:
+                    logger.error("💥 Discord retry also failed")
+
+    # ===========================================
+    # LEGACY METHODS (For Backward Compatibility)
+    # ===========================================
+
+    def send_purchase_success(self, data: Dict, result: Dict):
+        """Legacy method - redirects to new enhanced method."""
+        self.send_purchase_order_success(data, result)
+
+    def send_sale_success(self, data: Dict, result: Dict):
+        """Legacy method - redirects to new enhanced method."""  
+        self.send_sales_order_success(data, result)
+
+    def send_processing_error(self, error_type: str, message: str, details: Dict):
+        """Legacy method - redirects to new enhanced method."""
+        self.send_error_notification(f"❌ {error_type}", message, details)
