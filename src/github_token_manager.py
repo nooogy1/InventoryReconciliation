@@ -1,16 +1,14 @@
 """
 GitHub Gist-based token manager for Zoho OAuth access tokens.
 Implements caching pattern to reduce unnecessary refresh requests.
+Stores tokens in plain text in secret GitHub Gist.
 """
 
 import json
 import logging
 import requests
-import base64
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
-from cryptography.fernet import Fernet
-import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -22,15 +20,6 @@ class GitHubGistTokenManager:
         self.config = config
         self.github_token = config.get('GITHUB_TOKEN')
         self.gist_id = config.get('ZOHO_ACCESS_GIST_ID')
-        self.encrypt_tokens = config.get_bool('ENCRYPT_TOKENS', True)
-        
-        # Generate encryption key from config if encryption is enabled
-        self._encryption_key = None
-        if self.encrypt_tokens:
-            # Use a deterministic key based on config values
-            key_material = f"{self.github_token}{self.gist_id}".encode()
-            key_hash = hashlib.sha256(key_material).digest()
-            self._encryption_key = base64.urlsafe_b64encode(key_hash[:32])
         
         # Validate required configuration
         if not self.github_token:
@@ -40,7 +29,7 @@ class GitHubGistTokenManager:
         
         logger.info("GitHub Gist token manager initialized")
         logger.info(f"   - Gist ID: {self.gist_id}")
-        logger.info(f"   - Encryption: {'Enabled' if self.encrypt_tokens else 'Disabled'}")
+        logger.info(f"   - Storage: Plain text (no encryption)")
 
     def get_cached_token(self) -> Optional[Dict[str, Any]]:
         """
@@ -84,13 +73,6 @@ class GitHubGistTokenManager:
             if not token_content:
                 logger.warning("Empty token content in gist")
                 return None
-            
-            # Decrypt if encryption is enabled
-            if self.encrypt_tokens:
-                token_content = self._decrypt_content(token_content)
-                if not token_content:
-                    logger.error("Failed to decrypt token content")
-                    return None
             
             token_data = json.loads(token_content)
             
@@ -145,13 +127,6 @@ class GitHubGistTokenManager:
             
             # Convert to JSON
             token_content = json.dumps(token_data, indent=2)
-            
-            # Encrypt if encryption is enabled
-            if self.encrypt_tokens:
-                token_content = self._encrypt_content(token_content)
-                if not token_content:
-                    logger.error("Failed to encrypt token content")
-                    return False
             
             # Prepare gist data
             gist_data = {
@@ -270,35 +245,6 @@ class GitHubGistTokenManager:
             
         except:
             return False
-
-    def _encrypt_content(self, content: str) -> Optional[str]:
-        """Encrypt content using Fernet encryption."""
-        try:
-            if not self._encryption_key:
-                return content
-                
-            fernet = Fernet(self._encryption_key)
-            encrypted_bytes = fernet.encrypt(content.encode())
-            return base64.urlsafe_b64encode(encrypted_bytes).decode()
-            
-        except Exception as e:
-            logger.error(f"Encryption failed: {e}")
-            return None
-
-    def _decrypt_content(self, encrypted_content: str) -> Optional[str]:
-        """Decrypt content using Fernet encryption."""
-        try:
-            if not self._encryption_key:
-                return encrypted_content
-                
-            fernet = Fernet(self._encryption_key)
-            encrypted_bytes = base64.urlsafe_b64decode(encrypted_content.encode())
-            decrypted_bytes = fernet.decrypt(encrypted_bytes)
-            return decrypted_bytes.decode()
-            
-        except Exception as e:
-            logger.error(f"Decryption failed: {e}")
-            return None
 
     def get_token_info(self) -> Dict[str, Any]:
         """Get information about the current cached token."""
