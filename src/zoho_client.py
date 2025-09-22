@@ -90,8 +90,8 @@ class ZohoClient:
             
         logger.info("🔗 First Zoho API access - establishing connection...")
         
-        # Initialize connection
-        if self._refresh_access_token():
+        # Initialize connection - FIX: Use _ensure_access_token instead of _refresh_access_token
+        if self._ensure_access_token():
             self.is_available = self.test_connection()
             if self.is_available:
                 self._load_cache()
@@ -292,10 +292,10 @@ class ZohoClient:
                 timeout=30
             )
             
-            # Handle token expiration
+            # Handle token expiration - FIX: Use _ensure_access_token instead of _refresh_access_token
             if response.status_code == 401 and retry:
                 logger.info("🔑 Token expired, refreshing...")
-                self._refresh_access_token()
+                self._ensure_access_token()
                 return self._make_api_request(method, endpoint, data, params, retry=False)
                 
             response.raise_for_status()
@@ -505,36 +505,35 @@ class ZohoClient:
         }
         
         order_number = airtable_data.get('order_number', 'UNKNOWN')
-        channel = airtable_data.get('channel', 'Unknown Channel')
-        customer_email = airtable_data.get('customer_email', '')
+        channel = airtable_data.get('channel', 'Direct Sales')
         
         logger.info(f"🔄 Processing sale with proper workflow: {order_number}")
         logger.info(f"   - Channel: {channel}")
         logger.info(f"   - Items: {len(airtable_data.get('items', []))}")
         
         try:
-            # Step 1: Find or create customer/channel
-            logger.info("👤 Step 1: Finding/creating customer...")
-            customer_id = self._find_or_create_customer(channel, customer_email)
+            # Step 1: Find or create customer
+            logger.info("👥 Step 1: Finding/creating customer...")
+            customer_id = self._find_or_create_customer(channel, airtable_data.get('customer_email'))
             result['workflow_steps'].append(f"Customer resolved: {channel} (ID: {customer_id})")
             
-            # Step 2: Validate items and stock availability
-            logger.info("📦 Step 2: Validating items and stock...")
+            # Step 2: Validate inventory and prepare items
+            logger.info("📦 Step 2: Validating inventory...")
             processed_items = []
             total_revenue = 0
             
             for item in airtable_data.get('items', []):
                 item_id = self._ensure_item_exists_in_zoho(item.get('sku'), item.get('name'))
                 
-                # Check stock availability
+                # Check available stock
                 item_details = self._get_item_details(item_id)
-                available_stock = item_details.get('stock_on_hand', 0)
+                available_stock = item_details.get('available_stock', 0)
                 requested_qty = item.get('quantity', 0)
+                sale_price = item.get('sale_price', 0)
                 
                 if available_stock < requested_qty:
-                    logger.warning(f"⚠️ Insufficient stock for {item.get('name')}: {available_stock} < {requested_qty}")
+                    logger.warning(f"⚠️ Insufficient stock for {item.get('sku')}: {available_stock} < {requested_qty}")
                 
-                sale_price = item.get('sale_price', 0)
                 item_revenue = requested_qty * sale_price
                 total_revenue += item_revenue
                 
@@ -632,80 +631,6 @@ class ZohoClient:
                     vendor_id = vendor['contact_id']
                     
                     with self._cache_lock:
-                        self._cache['vendors'][standardized_name] = vendor_id
-                    
-                    logger.info(f"✅ Found existing vendor: {standardized_name} (ID: {vendor_id})")
-                    return vendor_id
-            
-            # Create new vendor
-            vendor_create_data = {
-                'contact_name': standardized_name,
-                'contact_type': 'vendor',
-                'company_name': standardized_name
-            }
-            
-            create_response = self._make_api_request('POST', 'contacts', vendor_create_data)
-            vendor_id = create_response.get('contact', {}).get('contact_id')
-            
-            with self._cache_lock:
-                self._cache['vendors'][standardized_name] = vendor_id
-            
-            logger.info(f"✅ Created new vendor: {standardized_name} (ID: {vendor_id})")
-            return vendor_id
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to find/create vendor {vendor_name}: {e}")
-            raise
-
-    def _standardize_vendor_name(self, vendor_name: str) -> str:
-        """Clean and standardize vendor names."""
-        if not vendor_name:
-            return "Unknown Vendor"
-        
-        # Basic cleanup
-        standardized = vendor_name.strip()
-        
-        # Common standardizations
-        standardizations = {
-            'ebay': 'eBay',
-            'amazon': 'Amazon',
-            'tcgplayer': 'TCGPlayer',
-            'shopify': 'Shopify'
-        }
-        
-        for original, standard in standardizations.items():
-            if original in standardized.lower():
-                standardized = standard
-                break
-        
-        return standardized
-
-    # ===========================================
-    # CUSTOMER MANAGEMENT
-    # ===========================================
-
-    def _find_or_create_customer(self, channel_name: str, customer_email: str = None) -> str:
-        """Find existing customer or create new one for sales channel."""
-        standardized_name = self._standardize_channel_name(channel_name)
-        
-        # Check cache first
-        with self._cache_lock:
-            if standardized_name in self._cache['customers']:
-                return self._cache['customers'][standardized_name]
-        
-        try:
-            # Search for existing customer
-            search_response = self._make_api_request('GET', 'contacts', {
-                'contact_type': 'customer',
-                'search_text': standardized_name
-            })
-            
-            customers = search_response.get('contacts', [])
-            for customer in customers:
-                if customer.get('contact_name', '').lower() == standardized_name.lower():
-                    customer_id = customer['contact_id']
-                    
-                    with self._cache_lock:
                         self._cache['customers'][standardized_name] = customer_id
                     
                     logger.info(f"✅ Found existing customer: {standardized_name} (ID: {customer_id})")
@@ -735,7 +660,7 @@ class ZohoClient:
             raise
 
     def _standardize_channel_name(self, channel_name: str) -> str:
-        """Clean and standardize sales channel names."""
+        """Clean and standardize channel names for customer creation."""
         if not channel_name:
             return "Direct Sales"
         
@@ -924,40 +849,41 @@ class ZohoClient:
         
         for item in items:
             try:
-                # Get current item rate (Zoho maintains FIFO automatically)
+                # Get current item details to find the current stock rate
                 item_details = self._get_item_details(item['item_id'])
-                current_rate = item_details.get('rate', 0)
+                stock_rate = item_details.get('stock_rate', 0)
                 quantity = item['quantity']
                 
-                item_cogs = quantity * current_rate
+                item_cogs = stock_rate * quantity
                 total_cogs += item_cogs
                 
-                logger.debug(f"COGS calculation - {item['sku']}: {quantity} × ${current_rate} = ${item_cogs}")
+                logger.debug(f"COGS calculation: {item['sku']} - {quantity} × ${stock_rate} = ${item_cogs}")
                 
             except Exception as e:
-                logger.warning(f"⚠️ Could not calculate COGS for {item.get('sku')}: {e}")
+                logger.warning(f"⚠️ Could not calculate COGS for item {item.get('sku')}: {e}")
         
         return total_cogs
 
     # ===========================================
-    # CLEANUP AND ROLLBACK METHODS
+    # CLEANUP METHODS
     # ===========================================
 
     def _cleanup_failed_purchase(self, po_id: str, bill_id: str = None):
-        """Clean up failed purchase transaction."""
+        """Clean up failed purchase workflow."""
         try:
             if bill_id:
                 logger.info(f"🧹 Cleaning up failed bill: {bill_id}")
                 self._make_api_request('DELETE', f'bills/{bill_id}')
             
-            logger.info(f"🧹 Cleaning up failed purchase order: {po_id}")
-            self._make_api_request('DELETE', f'purchaseorders/{po_id}')
-            
+            if po_id:
+                logger.info(f"🧹 Cleaning up failed purchase order: {po_id}")
+                self._make_api_request('DELETE', f'purchaseorders/{po_id}')
+                
         except Exception as e:
-            logger.error(f"⚠️ Failed to cleanup purchase transaction: {e}")
+            logger.warning(f"⚠️ Cleanup failed: {e}")
 
     def _cleanup_failed_sale(self, so_id: str, invoice_id: str = None, shipment_id: str = None):
-        """Clean up failed sales transaction."""
+        """Clean up failed sales workflow."""
         try:
             if shipment_id:
                 logger.info(f"🧹 Cleaning up failed shipment: {shipment_id}")
@@ -967,11 +893,12 @@ class ZohoClient:
                 logger.info(f"🧹 Cleaning up failed invoice: {invoice_id}")
                 self._make_api_request('DELETE', f'invoices/{invoice_id}')
             
-            logger.info(f"🧹 Cleaning up failed sales order: {so_id}")
-            self._make_api_request('DELETE', f'salesorders/{so_id}')
-            
+            if so_id:
+                logger.info(f"🧹 Cleaning up failed sales order: {so_id}")
+                self._make_api_request('DELETE', f'salesorders/{so_id}')
+                
         except Exception as e:
-            logger.error(f"⚠️ Failed to cleanup sales transaction: {e}")
+            logger.warning(f"⚠️ Cleanup failed: {e}")
 
     # ===========================================
     # VALIDATION METHODS
@@ -1059,43 +986,40 @@ class ZohoClient:
                         'quantity_adjusted': quantity,
                         'rate': unit_price,
                         'current_stock': item_details.get('stock_on_hand', 0),
-                        'current_rate': item_details.get('rate', 0)
                     })
                     
                     result['items_processed'].append({
-                        'item_id': item_id,
                         'sku': sku,
                         'name': name,
                         'quantity': quantity,
-                        'unit_price': unit_price
+                        'rate': unit_price,
+                        'item_id': item_id
                     })
                     
-                    logger.info(f"      ✅ Item processed successfully")
+                    logger.info(f"      ✅ Item processed: {sku} (ID: {item_id})")
                     
                 except Exception as e:
-                    result['errors'].append(f"Failed to process item {name}: {e}")
-                    logger.error(f"      ❌ Failed to process item {name}: {e}")
-                    
+                    logger.error(f"      ❌ Failed to process item {sku}: {e}")
+                    result['errors'].append(f"Failed to process item {sku}: {e}")
+            
+            # Create stock adjustment if we have items to process
             if items_for_adjustment:
-                # Create inventory adjustment for stock increase
                 try:
+                    # Build adjustment data
                     adjustment_data = {
-                        'date': datetime.now().strftime('%Y-%m-%d'),
+                        'date': airtable_data.get('date', datetime.now().strftime('%Y-%m-%d')),
+                        'reference_number': airtable_data.get('order_number', ''),
+                        'description': f"Purchase adjustment - Order: {airtable_data.get('order_number', '')}",
                         'reason': 'Purchase - Stock Received',
-                        'adjustment_type': 'quantity',
-                        'line_items': []
+                        'line_items': [
+                            {
+                                'item_id': item['item_id'],
+                                'quantity_adjusted': item['quantity_adjusted'],
+                                'rate': item['rate']
+                            }
+                            for item in items_for_adjustment
+                        ]
                     }
-                    
-                    # Generate reference number
-                    order_ref = airtable_data.get('order_number', 'UNKNOWN')
-                    adjustment_data['reference_number'] = f"PURCHASE-{order_ref}-{datetime.now().strftime('%Y%m%d')}"
-                    
-                    for item in items_for_adjustment:
-                        adjustment_data['line_items'].append({
-                            'item_id': item['item_id'],
-                            'quantity_adjusted': item['quantity_adjusted'],
-                            'rate': item['rate']
-                        })
                     
                     logger.info(f"📈 Creating stock adjustment:")
                     logger.info(f"   - Type: Purchase (Stock Increase)")
@@ -1169,6 +1093,7 @@ class ZohoClient:
                     
                     # Get current item details for WAC calculation
                     item_details = self._get_item_details(item_id)
+                    current_stock = item_details.get('stock_on_hand', 0)
                     current_rate = item_details.get('rate', 0)
                     
                     # Calculate revenue and COGS
@@ -1182,54 +1107,55 @@ class ZohoClient:
                         'item_id': item_id,
                         'name': name,
                         'sku': sku,
-                        'quantity_adjusted': -quantity,  # Negative for sale
-                        'rate': current_rate,  # Use WAC for COGS
+                        'quantity_adjusted': -quantity,  # Negative for sale reduction
+                        'current_stock': current_stock,
                         'sale_price': sale_price,
-                        'revenue': item_revenue,
-                        'cogs': item_cogs
+                        'cogs_rate': current_rate
                     })
                     
                     result['items_processed'].append({
-                        'item_id': item_id,
                         'sku': sku,
                         'name': name,
                         'quantity': quantity,
                         'sale_price': sale_price,
+                        'revenue': item_revenue,
                         'cogs': item_cogs,
-                        'revenue': item_revenue
+                        'item_id': item_id
                     })
                     
-                    logger.info(f"      ✅ Item processed successfully")
+                    logger.info(f"      ✅ Item processed: {sku} (Revenue: ${item_revenue}, COGS: ${item_cogs})")
                     
                 except Exception as e:
-                    result['errors'].append(f"Failed to process item {name}: {e}")
-                    logger.error(f"      ❌ Failed to process item {name}: {e}")
-                    
+                    logger.error(f"      ❌ Failed to process item {sku}: {e}")
+                    result['errors'].append(f"Failed to process item {sku}: {e}")
+            
+            result['revenue'] = total_revenue
+            result['cogs'] = total_cogs
+            
+            # Create stock adjustment if we have items to process
             if items_for_adjustment:
-                # Create inventory adjustment for stock decrease
                 try:
+                    # Build adjustment data for sale (stock reduction)
                     adjustment_data = {
-                        'date': datetime.now().strftime('%Y-%m-%d'),
+                        'date': airtable_data.get('date', datetime.now().strftime('%Y-%m-%d')),
+                        'reference_number': airtable_data.get('order_number', ''),
+                        'description': f"Sale adjustment - Order: {airtable_data.get('order_number', '')}",
                         'reason': 'Sale - Stock Reduced',
-                        'adjustment_type': 'quantity',
-                        'line_items': []
+                        'line_items': [
+                            {
+                                'item_id': item['item_id'],
+                                'quantity_adjusted': item['quantity_adjusted']  # Already negative
+                            }
+                            for item in items_for_adjustment
+                        ]
                     }
                     
-                    # Generate reference number
-                    order_ref = airtable_data.get('order_number', 'UNKNOWN')
-                    adjustment_data['reference_number'] = f"SALE-{order_ref}-{datetime.now().strftime('%Y%m%d')}"
-                    
-                    for item in items_for_adjustment:
-                        adjustment_data['line_items'].append({
-                            'item_id': item['item_id'],
-                            'quantity_adjusted': item['quantity_adjusted'],  # Negative
-                            'rate': item['rate']
-                        })
-                    
                     logger.info(f"📉 Creating stock adjustment:")
-                    logger.info(f"   - Type: Sale (Stock Decrease)")
+                    logger.info(f"   - Type: Sale (Stock Reduction)")
                     logger.info(f"   - Date: {adjustment_data['date']}")
                     logger.info(f"   - Reference: {adjustment_data['reference_number']}")
+                    logger.info(f"   - Revenue: ${total_revenue}")
+                    logger.info(f"   - COGS: ${total_cogs}")
                     
                     # Create the adjustment
                     adjustment_response = self._make_api_request(
@@ -1241,13 +1167,9 @@ class ZohoClient:
                     result['adjustment_id'] = adjustment_response.get('inventory_adjustment', {}).get('inventory_adjustment_id')
                     result['stock_adjusted'] = True
                     result['success'] = True
-                    result['revenue'] = total_revenue
-                    result['cogs'] = total_cogs
                     
                     logger.info(f"✅ Stock adjustment created successfully:")
                     logger.info(f"   - Adjustment ID: {result['adjustment_id']}")
-                    logger.info(f"   - Revenue: ${total_revenue:.2f}")
-                    logger.info(f"   - COGS: ${total_cogs:.2f}")
                     
                 except Exception as e:
                     result['errors'].append(f"Failed to create stock adjustment: {e}")
@@ -1261,4 +1183,77 @@ class ZohoClient:
             result['errors'].append(f"Sale processing error: {e}")
             logger.error(f"💥 Failed to process sale: {e}", exc_info=True)
             
-        return result
+        return resultself._cache['vendors'][standardized_name] = vendor_id
+                    
+                    logger.info(f"✅ Found existing vendor: {standardized_name} (ID: {vendor_id})")
+                    return vendor_id
+            
+            # Create new vendor
+            vendor_create_data = {
+                'contact_name': standardized_name,
+                'contact_type': 'vendor',
+                'company_name': standardized_name
+            }
+            
+            create_response = self._make_api_request('POST', 'contacts', vendor_create_data)
+            vendor_id = create_response.get('contact', {}).get('contact_id')
+            
+            with self._cache_lock:
+                self._cache['vendors'][standardized_name] = vendor_id
+            
+            logger.info(f"✅ Created new vendor: {standardized_name} (ID: {vendor_id})")
+            return vendor_id
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to find/create vendor {vendor_name}: {e}")
+            raise
+
+    def _standardize_vendor_name(self, vendor_name: str) -> str:
+        """Clean and standardize vendor names."""
+        if not vendor_name:
+            return "Unknown Vendor"
+        
+        # Basic cleanup
+        standardized = vendor_name.strip()
+        
+        # Common standardizations
+        standardizations = {
+            'ebay': 'eBay',
+            'amazon': 'Amazon',
+            'tcgplayer': 'TCGPlayer',
+            'shopify': 'Shopify'
+        }
+        
+        for original, standard in standardizations.items():
+            if original in standardized.lower():
+                standardized = standard
+                break
+        
+        return standardized
+
+    # ===========================================
+    # CUSTOMER MANAGEMENT
+    # ===========================================
+
+    def _find_or_create_customer(self, channel_name: str, customer_email: str = None) -> str:
+        """Find existing customer or create new one for sales channel."""
+        standardized_name = self._standardize_channel_name(channel_name)
+        
+        # Check cache first
+        with self._cache_lock:
+            if standardized_name in self._cache['customers']:
+                return self._cache['customers'][standardized_name]
+        
+        try:
+            # Search for existing customer
+            search_response = self._make_api_request('GET', 'contacts', {
+                'contact_type': 'customer',
+                'search_text': standardized_name
+            })
+            
+            customers = search_response.get('contacts', [])
+            for customer in customers:
+                if customer.get('contact_name', '').lower() == standardized_name.lower():
+                    customer_id = customer['contact_id']
+                    
+                    with self._cache_lock:
