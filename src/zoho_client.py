@@ -37,6 +37,11 @@ class ZohoClient:
         logger.info(f"   - Auto Create Shipments: {self.auto_create_shipments}")
         logger.info(f"   - Allow Direct Adjustments: {self.allow_direct_adjustments}")
 
+    @property
+    def is_available(self) -> bool:
+        """Check if Zoho API is available."""
+        return self.base_client._ensure_connection()
+
     def process_complete_data(self, clean_data: Dict, transaction_type: str) -> Dict:
         """
         Process clean data from Airtable through proper Zoho workflows.
