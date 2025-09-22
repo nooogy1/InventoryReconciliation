@@ -313,7 +313,7 @@ class ZohoWorkflowProcessor:
                 self.base_client._make_api_request('DELETE', f'salesorders/{so_id}')
                 
         except Exception as e:
-            logger.warning(f"⚠️ Cleanup failed: {e}")"Vendor resolved: {vendor_name} (ID: {vendor_id})")
+            logger.warning(f"⚠️ Cleanup failed: {e}")
             
             # Step 2: Ensure all items exist in Zoho
             logger.info("📦 Step 2: Ensuring items exist...")
