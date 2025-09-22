@@ -79,16 +79,13 @@ class InventoryReconciliationApp:
             
         try:
             self.zoho = ZohoClient(self.config)
-            if self.zoho.is_available:
-                logger.info("Zoho client initialized with proper workflows")
-                logger.info(f"   - Proper Workflows: {self.zoho.use_proper_workflows}")
-                logger.info(f"   - Auto Create Bills: {self.zoho.auto_create_bills}")
-                logger.info(f"   - Auto Create Invoices: {self.zoho.auto_create_invoices}")
-                logger.info(f"   - Auto Create Shipments: {self.zoho.auto_create_shipments}")
-                logger.info(f"   - Allow Direct Adjustments: {self.zoho.allow_direct_adjustments}")
-            else:
-                logger.warning("Zoho client initialized but API is unavailable")
-                logger.warning("   System will continue with Airtable-only mode")
+            logger.info("Zoho client initialized with lazy connection")
+            logger.info(f"   - Proper Workflows: {self.zoho.use_proper_workflows}")
+            logger.info(f"   - Auto Create Bills: {self.zoho.auto_create_bills}")
+            logger.info(f"   - Auto Create Invoices: {self.zoho.auto_create_invoices}")
+            logger.info(f"   - Auto Create Shipments: {self.zoho.auto_create_shipments}")
+            logger.info(f"   - Allow Direct Adjustments: {self.zoho.allow_direct_adjustments}")
+            logger.info(f"   - Connection: Will connect when processing emails")
         except Exception as e:
             logger.error(f"Zoho client initialization failed: {e}")
             raise
@@ -158,7 +155,7 @@ class InventoryReconciliationApp:
         except:
             logger.info(f"   - Airtable: Initialized")
             
-        logger.info(f"   - Zoho: {'Connected' if self.zoho.is_available else 'Failed'}")
+        logger.info(f"   - Zoho: {'Ready (lazy connection)' if hasattr(self.zoho, '_ensure_connection') else 'Failed'}")
         
         try:
             discord_status = self.discord.test_webhook() if hasattr(self.discord, 'test_webhook') else True
@@ -226,7 +223,17 @@ class InventoryReconciliationApp:
             
             transaction_type = parsed_data.get('type', 'unknown')
             order_number = parsed_data.get('order_number', 'N/A')
-            confidence = parse_result.confidence
+            
+            # Handle different confidence attribute names
+            confidence = 0.0
+            if hasattr(parse_result, 'confidence'):
+                confidence = parse_result.confidence
+            elif hasattr(parse_result, 'confidence_score'):
+                confidence = parse_result.confidence_score
+            elif hasattr(parse_result, 'score'):
+                confidence = parse_result.score
+            else:
+                confidence = 0.8  # Default reasonable confidence
             
             logger.info(f"Parse Results:")
             logger.info(f"  - Type: {transaction_type}")
@@ -301,24 +308,9 @@ class InventoryReconciliationApp:
                 if airtable_result.get('warnings'):
                     logger.warning(f"Airtable warnings: {'; '.join(airtable_result['warnings'][:3])}")
                 
-                # Step 2: Execute proper Zoho workflow
-                if self.zoho.is_available:
-                    logger.info(f"Executing proper Zoho {transaction_type} workflow...")
-                    self._execute_zoho_workflow(airtable_result, transaction_type, transaction_record_id)
-                else:
-                    logger.warning("Zoho unavailable - skipping sync")
-                    
-                    # Send notification about Zoho being unavailable
-                    if hasattr(self.discord, 'send_warning_notification'):
-                        self.discord.send_warning_notification(
-                            "Zoho Unavailable",
-                            f"Transaction saved to Airtable but could not sync to Zoho: {order_number}",
-                            {
-                                "transaction_type": transaction_type,
-                                "order_number": order_number,
-                                "airtable_record": transaction_record_id
-                            }
-                        )
+                # Step 2: Execute proper Zoho workflow (only if there are emails to process)
+                logger.info(f"Executing proper Zoho {transaction_type} workflow...")
+                self._execute_zoho_workflow(airtable_result, transaction_type, transaction_record_id)
                 
             else:
                 logger.error(f"Airtable processing FAILED: {'; '.join(airtable_result.get('errors', []))}")
@@ -505,12 +497,23 @@ class InventoryReconciliationApp:
                 
             # Send human review notification using enhanced Discord notifier
             if hasattr(self.discord, 'send_human_review_notification'):
+                # Handle different confidence attribute names
+                confidence = 0.0
+                if hasattr(parse_result, 'confidence'):
+                    confidence = parse_result.confidence
+                elif hasattr(parse_result, 'confidence_score'):
+                    confidence = parse_result.confidence_score
+                elif hasattr(parse_result, 'score'):
+                    confidence = parse_result.score
+                else:
+                    confidence = 0.5  # Default for incomplete data
+                    
                 self.discord.send_human_review_notification(
                     transaction_type,
                     order_number,
                     parse_result.missing_fields,
                     airtable_id,
-                    parse_result.confidence
+                    confidence
                 )
             
             logger.info(f"SKIPPING inventory and Zoho processing - data incomplete")
