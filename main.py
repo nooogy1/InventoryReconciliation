@@ -202,7 +202,16 @@ class InventoryReconciliationApp:
                 self.stats['parse_failed'] += 1
                 return
                 
-            if parse_result.status == ParseStatus.NOT_INVENTORY:
+            # Check if this is inventory-related (use different attribute names based on what's available)
+            if hasattr(ParseStatus, 'NOT_INVENTORY'):
+                if parse_result.status == ParseStatus.NOT_INVENTORY:
+                    logger.info(f"Email not related to inventory - skipping: {subject}")
+                    return
+            elif hasattr(ParseStatus, 'UNKNOWN_TYPE'):
+                if parse_result.status == ParseStatus.UNKNOWN_TYPE:
+                    logger.info(f"Email not related to inventory - skipping: {subject}")
+                    return
+            elif hasattr(parse_result, 'status') and str(parse_result.status).upper() in ['NOT_INVENTORY', 'UNKNOWN_TYPE', 'UNKNOWN']:
                 logger.info(f"Email not related to inventory - skipping: {subject}")
                 return
                 
