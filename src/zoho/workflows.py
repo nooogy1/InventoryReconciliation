@@ -88,6 +88,96 @@ class ZohoWorkflowProcessor:
             # Step 1: Find or create vendor
             logger.info("👥 Step 1: Finding/creating vendor...")
             vendor_id = self.entity_manager.find_or_create_vendor(vendor_name, airtable_data)
+            result['workflow_steps'].append(f"Vendor resolved: {vendor_name} (ID: {vendor_id})")
+            
+            # Step 2: Ensure all items exist in Zoho
+            logger.info("📦 Step 2: Ensuring items exist...")
+            processed_items = []
+            for item in airtable_data.get('items', []):
+                item_id = self.entity_manager.ensure_item_exists_in_zoho(item.get('sku'), item.get('name'))
+                processed_items.append({
+                    'item_id': item_id,
+                    'sku': item.get('sku'),
+                    'name': item.get('name'),
+                    'quantity': item.get('quantity', 0),
+                    'unit_price': item.get('unit_price', 0)
+                })
+            
+            result['items_processed'] = processed_items
+            result['workflow_steps'].append(f"Items validated: {len(processed_items)}")
+            
+            # Step 3: Create Purchase Order
+            logger.info("📋 Step 3: Creating Purchase Order...")
+            po_data = self._build_purchase_order_data(vendor_id, processed_items, airtable_data)
+            po_response = self.base_client._make_api_request('POST', 'purchaseorders', po_data)
+            
+            po_id = po_response.get('purchaseorder', {}).get('purchaseorder_id')
+            po_number = po_response.get('purchaseorder', {}).get('purchaseorder_number')
+            result['purchase_order_id'] = po_id
+            result['workflow_steps'].append(f"Purchase Order created: {po_number}")
+            
+            logger.info(f"✅ Purchase Order created: {po_number} (ID: {po_id})")
+            
+            # Step 4: Mark PO as received (updates inventory)
+            if self.auto_receive_po:
+                logger.info("📥 Step 4: Marking Purchase Order as received...")
+                receive_data = self._build_receive_data(po_id, processed_items)
+                receive_response = self.base_client._make_api_request('POST', f'purchaseorders/{po_id}/receive', receive_data)
+                result['workflow_steps'].append("Purchase Order marked as received (inventory updated)")
+                
+                logger.info("✅ Purchase Order marked as received - inventory updated")
+            
+            # Step 5: Create Bill (for accounting consistency)
+            if self.auto_create_bills:
+                logger.info("🧾 Step 5: Creating Bill from Purchase Order...")
+                bill_response = self.base_client._make_api_request('POST', f'purchaseorders/{po_id}/convertto/bill')
+                
+                bill_id = bill_response.get('bill', {}).get('bill_id')
+                bill_number = bill_response.get('bill', {}).get('bill_number')
+                result['bill_id'] = bill_id
+                result['workflow_steps'].append(f"Bill created: {bill_number}")
+                
+                logger.info(f"✅ Bill created: {bill_number} (ID: {bill_id})")
+            
+            result['success'] = True
+            logger.info(f"🎉 Purchase workflow completed successfully for {order_number}")
+            
+        except Exception as e:
+            error_msg = f"Purchase workflow failed: {e}"
+            result['errors'].append(error_msg)
+            logger.error(f"❌ {error_msg}", exc_info=True)
+            
+            # Cleanup on failure
+            if result.get('purchase_order_id'):
+                self._cleanup_failed_purchase(result['purchase_order_id'], result.get('bill_id'))
+                
+        return result
+
+    def _process_sale_with_proper_workflow(self, airtable_data: Dict) -> Dict:
+        """Process sale using proper Sales Order → Invoice → Shipment workflow."""
+        result = {
+            'success': False,
+            'sales_order_id': None,
+            'invoice_id': None,
+            'shipment_id': None,
+            'items_processed': [],
+            'revenue': 0,
+            'cogs': 0,
+            'errors': [],
+            'workflow_steps': []
+        }
+        
+        order_number = airtable_data.get('order_number', 'UNKNOWN')
+        channel = airtable_data.get('channel', 'Direct Sales')
+        
+        logger.info(f"🔄 Processing sale with proper workflow: {order_number}")
+        logger.info(f"   - Channel: {channel}")
+        logger.info(f"   - Items: {len(airtable_data.get('items', []))}")
+        
+        try:
+            # Step 1: Find or create customer
+            logger.info("👥 Step 1: Finding/creating customer...")
+            customer_id = self.entity_manager.find_or_create_customer(channel, airtable_data.get('customer_email'))
             result['workflow_steps'].append(f"Customer resolved: {channel} (ID: {customer_id})")
             
             # Step 2: Validate inventory and prepare items
@@ -314,93 +404,3 @@ class ZohoWorkflowProcessor:
                 
         except Exception as e:
             logger.warning(f"⚠️ Cleanup failed: {e}")
-            
-            # Step 2: Ensure all items exist in Zoho
-            logger.info("📦 Step 2: Ensuring items exist...")
-            processed_items = []
-            for item in airtable_data.get('items', []):
-                item_id = self.entity_manager.ensure_item_exists_in_zoho(item.get('sku'), item.get('name'))
-                processed_items.append({
-                    'item_id': item_id,
-                    'sku': item.get('sku'),
-                    'name': item.get('name'),
-                    'quantity': item.get('quantity', 0),
-                    'unit_price': item.get('unit_price', 0)
-                })
-            
-            result['items_processed'] = processed_items
-            result['workflow_steps'].append(f"Items validated: {len(processed_items)}")
-            
-            # Step 3: Create Purchase Order
-            logger.info("📋 Step 3: Creating Purchase Order...")
-            po_data = self._build_purchase_order_data(vendor_id, processed_items, airtable_data)
-            po_response = self.base_client._make_api_request('POST', 'purchaseorders', po_data)
-            
-            po_id = po_response.get('purchaseorder', {}).get('purchaseorder_id')
-            po_number = po_response.get('purchaseorder', {}).get('purchaseorder_number')
-            result['purchase_order_id'] = po_id
-            result['workflow_steps'].append(f"Purchase Order created: {po_number}")
-            
-            logger.info(f"✅ Purchase Order created: {po_number} (ID: {po_id})")
-            
-            # Step 4: Mark PO as received (updates inventory)
-            if self.auto_receive_po:
-                logger.info("📥 Step 4: Marking Purchase Order as received...")
-                receive_data = self._build_receive_data(po_id, processed_items)
-                receive_response = self.base_client._make_api_request('POST', f'purchaseorders/{po_id}/receive', receive_data)
-                result['workflow_steps'].append("Purchase Order marked as received (inventory updated)")
-                
-                logger.info("✅ Purchase Order marked as received - inventory updated")
-            
-            # Step 5: Create Bill (for accounting consistency)
-            if self.auto_create_bills:
-                logger.info("🧾 Step 5: Creating Bill from Purchase Order...")
-                bill_response = self.base_client._make_api_request('POST', f'purchaseorders/{po_id}/convertto/bill')
-                
-                bill_id = bill_response.get('bill', {}).get('bill_id')
-                bill_number = bill_response.get('bill', {}).get('bill_number')
-                result['bill_id'] = bill_id
-                result['workflow_steps'].append(f"Bill created: {bill_number}")
-                
-                logger.info(f"✅ Bill created: {bill_number} (ID: {bill_id})")
-            
-            result['success'] = True
-            logger.info(f"🎉 Purchase workflow completed successfully for {order_number}")
-            
-        except Exception as e:
-            error_msg = f"Purchase workflow failed: {e}"
-            result['errors'].append(error_msg)
-            logger.error(f"❌ {error_msg}", exc_info=True)
-            
-            # Cleanup on failure
-            if result.get('purchase_order_id'):
-                self._cleanup_failed_purchase(result['purchase_order_id'], result.get('bill_id'))
-                
-        return result
-
-    def _process_sale_with_proper_workflow(self, airtable_data: Dict) -> Dict:
-        """Process sale using proper Sales Order → Invoice → Shipment workflow."""
-        result = {
-            'success': False,
-            'sales_order_id': None,
-            'invoice_id': None,
-            'shipment_id': None,
-            'items_processed': [],
-            'revenue': 0,
-            'cogs': 0,
-            'errors': [],
-            'workflow_steps': []
-        }
-        
-        order_number = airtable_data.get('order_number', 'UNKNOWN')
-        channel = airtable_data.get('channel', 'Direct Sales')
-        
-        logger.info(f"🔄 Processing sale with proper workflow: {order_number}")
-        logger.info(f"   - Channel: {channel}")
-        logger.info(f"   - Items: {len(airtable_data.get('items', []))}")
-        
-        try:
-            # Step 1: Find or create customer
-            logger.info("👥 Step 1: Finding/creating customer...")
-            customer_id = self.entity_manager.find_or_create_customer(channel, airtable_data.get('customer_email'))
-            result['workflow_steps'].append(f
